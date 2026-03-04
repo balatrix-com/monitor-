@@ -1,0 +1,421 @@
+Kimi: <function_calls>
+<invoke name="ipython">
+<parameter name="code">
+content = '''# FreeSWITCH ESL CDR Handler - Implementation Guide
+
+## Overview
+
+This document defines how to process FreeSWITCH ESL events to generate accurate CDRs that distinguish between INBOUND, OUTBOUND, and DID_FORWARD calls.
+
+## Critical Architecture Change
+
+**OLD (BROKEN):** Only tracking A-leg (direction=inbound) and guessing call type from single leg.
+**NEW (FIXED):** Tracking BOTH A-leg and B-leg, linking via Other-Leg-Unique-ID.
+
+### Call Leg Definitions
+
+- **A-Leg (Inbound):** First incoming leg from caller (CHANNEL_CREATE with direction=inbound, no Other-Leg-Unique-ID)
+- **B-Leg (Outbound):** Leg created by dialplan bridge (CHANNEL_CREATE with Other-Leg-Unique-ID pointing to A-leg)
+
+### Call Classification Rules
+
+1. **INBOUND:** A-leg from trunk + B-leg to internal extension (no RDNIS on B-leg, or dest is internal)
+2. **OUTBOUND:** A-leg from internal extension + B-leg to external trunk
+3. **DID_FORWARD:** A-leg from trunk + B-leg to external trunk + B-leg has Caller-RDNIS field (indicates diversion)
+4. **INTERNAL:** A-leg from extension + B-leg to extension
+
+## Database Column Mapping Reference
+
+| Column | Source Event | Field | Logic |
+|--------|-------------|-------|-------|
+| uuid | CHANNEL_CREATE (A-leg) | Unique-ID | Primary A-leg UUID |
+| b_uuid | CHANNEL_CREATE (B-leg) | Unique-ID | Store when B-leg created |
+| caller | CHANNEL_CREATE (A-leg) | Caller-Caller-ID-Number | Original caller |
+| callee | CHANNEL_CREATE (A-leg) | Caller-Destination-Number | Number originally dialed (DID for inbound) |
+| customer_id | CHANNEL_CREATE (A-leg) | Lookup via callee (DID) | Your existing lookup function |
+| call_type | Derived | See classification logic below | INBOUND/OUTBOUND/DID_FORWARD/INTERNAL |
+| dest_type | Derived | Based on B-leg destination | "extension", "external", "queue", "ivr" |
+| dest_value | CHANNEL_CREATE (B-leg) | Caller-Destination-Number | Where the call ended up (extension or forwarded number) |
+| status_code | CHANNEL_HANGUP_COMPLETE (A-leg) | Hangup-Cause | NORMAL_CLEARING, INCOMPATIBLE_DESTINATION, etc. |
+| event_type | Derived | From status_code + billsec | answered, no_answer, busy, failed, declined |
+| event_ts | CHANNEL_HANGUP_COMPLETE (A-leg) | Caller-Channel-Hangup-Time / 1000000 | Unix timestamp |
+| duration | CHANNEL_HANGUP_COMPLETE (A-leg) | variable_duration | Total seconds |
+| billsec | CHANNEL_HANGUP_COMPLETE (A-leg) | variable_billsec | Billable seconds |
+| ingress_trunk | CHANNEL_CREATE (A-leg) | variable_sip_received_ip or Caller-Network-Addr | Source IP/gateway |
+| egress_trunk | CHANNEL_CREATE (B-leg) | Caller-Network-Addr or variable_default_gateway | Destination for outbound legs |
+| originating_extension | CHANNEL_CREATE (A-leg) | Caller-Caller-ID-Number | If call_type=OUTBOUND, this is the extension |
+| outbound_caller_id | CHANNEL_CREATE (B-leg) | Caller-Caller-ID-Number | CLI presented on B-leg (for DID_FORWARD, usually original caller) |
+| originating_leg_uuid | A-leg UUID | Same as uuid | Reference to A-leg |
+
+## Critical Field: Caller-RDNIS
+
+**This is the key to identifying DID_FORWARD.**
+
+- **Definition:** Redirected Dialed Number Identification Service
+- **When present:** The B-leg (outbound leg) has this field set to the original DID number
+- **Indicator:** If B-leg CHANNEL_CREATE has `Caller-RDNIS` = "8883336661", it means the call to the B-leg destination is a forward/diversion of that DID
+
+From events.txt Call 4:
+```
+# B-leg CHANNEL_CREATE
+Caller-RDNIS: 8883336661
+Caller-Destination-Number: 9885564228
+```
+This means: "This outbound call to 9885564228 is a forward of the DID 8883336661"
+
+## Implementation Code
+
+### 1. Helper: Determine if number is internal
+
+```python
+def is_internal(number: str) -> bool:
+    """Check if number is internal extension vs external/trunk."""
+    if not number:
+        return False
+    # Adjust this logic based on your dialplan
+    # Example: 3-6 digits = internal, 7+ or starting with country code = external
+    return len(number) <= 6 and number.isdigit()
+```
+
+### 2. Modified handle_create
+
+Capture BOTH legs, not just inbound.
+
+```python
+def handle_create(event_dict: dict):
+    """Handle CHANNEL_CREATE - capture A-leg and B-leg."""
+    try:
+        uuid = event_dict.get("Unique-ID")
+        direction = (event_dict.get("Call-Direction") or "").lower()
+        other_leg = event_dict.get("Other-Leg-Unique-ID")  # Present if this is B-leg
+        start_ts = int(event_dict.get("Event-Date-Timestamp", 0)) // 1000000
+        
+        if direction == "inbound" and not other_leg:
+            # === A-LEG (Incoming call) ===
+            caller = event_dict.get("Caller-Caller-ID-Number", "")
+            callee = event_dict.get("Caller-Destination-Number", "")  # The DID
+            
+            # Determine ingress
+            ingress = (event_dict.get("variable_sip_received_ip") or 
+                      event_dict.get("Caller-Network-Addr", ""))
+            
+            customer_id = get_customer_id_from_number(callee) or ""
+            
+            call_data = {
+                "uuid": uuid,
+                "b_uuid": "",
+                "start_ts": str(start_ts),
+                "caller": caller,
+                "callee": callee,  # Original DID dialed
+                "customer_id": customer_id,
+                "call_status": "new",
+                "ingress_trunk": ingress,
+                "call_type": "pending",
+                "originating_extension": "",
+                "outbound_caller_id": "",
+                "forwarded_to": "",      # Will fill when B-leg arrives
+                "has_rdnis": "false",    # Will set to true if B-leg has RDNIS
+                "original_did": callee,  # Preserve original DID
+                "answer_ts": "",
+            }
+            
+            store_call_in_redis(call_data)
+            logger.info(f"CREATE A-leg: {uuid[:8]}... {caller} -> {callee}")
+            
+        elif other_leg:
+            # === B-LEG (Outbound leg from bridge) ===
+            # Link to A-leg
+            a_leg = get_call_from_redis(other_leg)
+            if not a_leg:
+                return
+                
+            # Capture forward indicators
+            rdnis = event_dict.get("Caller-RDNIS", "")  # KEY FIELD for DID_FORWARD
+            b_dest = event_dict.get("Caller-Destination-Number", "")
+            b_caller_id = event_dict.get("Caller-Caller-ID-Number", "")
+            
+            # Update A-leg record with B-leg info
+            a_leg["b_uuid"] = uuid
+            a_leg["forwarded_to"] = b_dest
+            a_leg["has_rdnis"] = "true" if rdnis else "false"
+            
+            if rdnis:
+                a_leg["original_did"] = rdnis  # Confirm original DID
+                
+            # For outbound calls, store the originating extension
+            if is_internal(a_leg.get("caller", "")):
+                a_leg["originating_extension"] = a_leg["caller"]
+                a_leg["outbound_caller_id"] = b_caller_id
+                
+            store_call_in_redis(a_leg)
+            logger.info(f"CREATE B-leg: {uuid[:8]}... -> {b_dest} (RDNIS: {rdnis})")
+            
+    except Exception as e:
+        logger.error(f"CREATE error: {e}")
+```
+
+### 3. Classification Logic
+
+```python
+def classify_call_type(a_leg_data: dict) -> tuple:
+    """
+    Determine call type and return tuple:
+    (call_type, dest_type, dest_value, egress_trunk)
+    """
+    b_uuid = a_leg_data.get("b_uuid")
+    has_rdnis = a_leg_data.get("has_rdnis") == "true"
+    forwarded_to = a_leg_data.get("forwarded_to", "")
+    original_callee = a_leg_data.get("callee", "")
+    caller = a_leg_data.get("caller", "")
+    
+    caller_internal = is_internal(caller)
+    dest_internal = is_internal(forwarded_to)
+    
+    # No B-leg = simple inbound that never bridged, or internal system call
+    if not b_uuid:
+        if caller_internal:
+            return "INTERNAL", "unknown", "", ""
+        return "INBOUND", "extension", original_callee, ""
+    
+    # === DID_FORWARD Detection ===
+    # External -> DID -> External (forwarded to PSTN)
+    # Key indicators: 
+    # 1. B-leg has RDNIS (means it's a diversion)
+    # 2. Destination is external
+    # 3. Original caller was external (came from trunk)
+    if has_rdnis and not dest_internal and not caller_internal:
+        return "DID_FORWARD", "external", forwarded_to, forwarded_to
+    
+    # === OUTBOUND Detection ===
+    # Extension -> External
+    # Indicators:
+    # 1. Caller is internal extension
+    # 2. Destination is external
+    # 3. No RDNIS (not a forward, originated from internal)
+    elif caller_internal and not dest_internal:
+        return "OUTBOUND", "external", forwarded_to, forwarded_to
+        
+    # === INBOUND Detection ===
+    # External -> Extension (answered internally)
+    # Indicators:
+    # 1. Caller is external
+    # 2. Destination is internal
+    elif not caller_internal and dest_internal:
+        return "INBOUND", "extension", forwarded_to, ""
+    
+    # === INTERNAL Detection ===
+    # Extension -> Extension
+    elif caller_internal and dest_internal:
+        return "INTERNAL", "extension", forwarded_to, ""
+    
+    # Fallback
+    return "UNKNOWN", "unknown", forwarded_to, ""
+```
+
+### 4. Modified handle_hangup_complete
+
+```python
+def handle_hangup_complete(event_dict: dict):
+    """Handle CHANNEL_HANGUP_COMPLETE - aggregate and finalize CDR."""
+    try:
+        uuid = event_dict.get("Unique-ID")
+        other_leg = event_dict.get("Other-Leg-Unique-ID")
+        
+        # If this is a B-leg hangup without A-leg context, ignore (we'll process on A-leg hangup)
+        # But update A-leg if we have the data
+        if other_leg:
+            a_leg = get_call_from_redis(other_leg)
+            if a_leg:
+                # Store B-leg hangup data on A-leg record temporarily
+                a_leg["b_hangup_cause"] = event_dict.get("Hangup-Cause", "")
+                store_call_in_redis(a_leg)
+            return
+        
+        # === A-LEG HANGUP - Finalize CDR ===
+        redis_data = get_call_from_redis(uuid)
+        if not redis_data:
+            logger.debug(f"No Redis data for {uuid}")
+            return
+        
+        # Extract metrics from HANGUP_COMPLETE event (authoritative)
+        duration = int(event_dict.get("variable_duration", 0))
+        billsec = int(event_dict.get("variable_billsec", 0))
+        hangup_cause = event_dict.get("Hangup-Cause", "UNKNOWN")
+        hangup_ts = int(event_dict.get("Caller-Channel-Hangup-Time", 0)) // 1000000
+        
+        # Determine event_type (final disposition)
+        if hangup_cause == "USER_BUSY":
+            event_type = "busy"
+        elif hangup_cause == "CALL_REJECTED":
+            event_type = "declined"
+        elif hangup_cause in ["NO_ANSWER", "NO_USER_RESPONSE", "ORIGINATOR_CANCEL", "RECOVERY_ON_TIMER_EXPIRE"]:
+            event_type = "no_answer"
+        elif hangup_cause == "INCOMPATIBLE_DESTINATION":
+            event_type = "failed"
+        elif hangup_cause == "NORMAL_CLEARING" and billsec > 0:
+            event_type = "answered"
+        elif hangup_cause == "NORMAL_CLEARING":
+            event_type = "no_answer"
+        else:
+            event_type = "answered" if billsec > 0 else "failed"
+        
+        # Classify call type
+        call_type, dest_type, dest_value, egress_trunk = classify_call_type(redis_data)
+        
+        # Build CDR
+        cdr = {
+            "uuid": uuid,
+            "b_uuid": redis_data.get("b_uuid"),
+            "event_type": event_type,
+            "event_ts": hangup_ts,
+            "caller": redis_data.get("caller"),
+            "callee": redis_data.get("original_did", redis_data.get("callee")),  # Use original DID
+            "customer_id": redis_data.get("customer_id"),
+            "dest_type": dest_type,
+            "dest_value": dest_value,  # Where it actually went
+            "status_code": hangup_cause,
+            "call_type": call_type,
+            "duration": duration,
+            "billsec": billsec,
+            "ingress_trunk": redis_data.get("ingress_trunk"),
+            "egress_trunk": egress_trunk or event_dict.get("variable_default_gateway", ""),
+            "gateway_id": event_dict.get("variable_sofia_profile_name", ""),
+        }
+        
+        # Type-specific fields
+        if call_type == "DID_FORWARD":
+            # Forwards: CLI presented to destination is original caller
+            cdr["outbound_caller_id"] = redis_data.get("caller")
+            cdr["originating_extension"] = ""
+            # callee should be the DID, dest_value is the forwarded number
+            cdr["callee"] = redis_data.get("original_did", redis_data.get("callee"))
+            
+        elif call_type == "OUTBOUND":
+            cdr["outbound_caller_id"] = redis_data.get("outbound_caller_id", redis_data.get("caller"))
+            cdr["originating_extension"] = redis_data.get("originating_extension", redis_data.get("caller"))
+            cdr["originating_leg_uuid"] = uuid
+            
+        elif call_type == "INBOUND":
+            cdr["outbound_caller_id"] = ""
+            cdr["originating_extension"] = ""
+            
+        # Save to DB
+        save_cdr_to_postgres(cdr)
+        
+        # Cleanup Redis
+        customer_id = redis_data.get("customer_id", "unknown")
+        remove_call_from_redis(uuid, customer_id)
+        
+        logger.info(f"CDR: {uuid[:8]}... {call_type} {event_type} "
+                   f"to {dest_value} ({duration}s/{billsec}s)")
+        
+    except Exception as e:
+        logger.error(f"HANGUP error: {e}", exc_info=True)
+```
+
+## Redis Data Schema (Per Call)
+
+Key: `customer:{customer_id}:call:{uuid}`
+
+Fields:
+- `uuid`: A-leg UUID
+- `b_uuid`: B-leg UUID (empty until bridged)
+- `caller`: Original caller number
+- `callee`: Original destination (DID or extension)
+- `original_did`: Preserved original DID (for forwards)
+- `customer_id`: Customer ID from lookup
+- `ingress_trunk`: Source IP/gateway
+- `forwarded_to`: B-leg destination (where call was sent)
+- `has_rdnis`: "true" or "false" (indicates if B-leg had RDNIS)
+- `originating_extension`: For outbound calls, the source extension
+- `outbound_caller_id`: CLI used on B-leg
+- `call_status`: new, ringing, answered, connected, completed
+- `start_ts`: Create timestamp
+- `answer_ts`: Answer timestamp (if answered)
+
+## Validation Checklist
+
+For each scenario in events.txt:
+
+### Call 1: 2154697017 -> 8899663322 (DID) -> 100202 (Extension)
+- [ ] A-leg: caller=2154697017, callee=8899663322, ingress=51.79.127.122
+- [ ] B-leg: forwarded_to=100202, has_rdnis=false (no RDNIS in events.txt)
+- [ ] Classification: INBOUND
+- [ ] dest_type=extension, dest_value=100202
+
+### Call 2: 100201 -> 100202 (Internal)
+- [ ] A-leg: caller=100201 (internal), callee=100202
+- [ ] B-leg: forwarded_to=100202, has_rdnis=false
+- [ ] Classification: INTERNAL
+- [ ] dest_type=extension, dest_value=100202
+
+### Call 3: 100201 -> 2154697017 (Outbound Failed)
+- [ ] A-leg: caller=100201 (internal), callee=2154697017 (external)
+- [ ] B-leg: forwarded_to=2154697017, has_rdnis=false
+- [ ] Classification: OUTBOUND
+- [ ] status_code=INCOMPATIBLE_DESTINATION
+- [ ] event_type=failed
+
+### Call 4: 2154697017 -> 8883336661 (DID) -> 9885564228 (Forward)
+- [ ] A-leg: caller=2154697017, callee=8883336661, ingress=51.79.127.122
+- [ ] B-leg: forwarded_to=9885564228, **has_rdnis=true**, RDNIS=8883336661
+- [ ] Classification: **DID_FORWARD**
+- [ ] dest_type=external, dest_value=9885564228
+- [ ] callee (in DB) = 8883336661 (the DID), dest_value = 9885564228 (where it went)
+- [ ] outbound_caller_id = 2154697017 (CLI presented to 9885564228)
+
+## Debugging Tips
+
+1. **Log the B-leg fields:** In handle_create for B-legs, always log:
+   - `Caller-Destination-Number` (where B-leg is calling)
+   - `Caller-RDNIS` (if present, indicates forward)
+   - `Other-Leg-Unique-ID` (should match A-leg UUID)
+
+2. **Check Redis state:** Before HANGUP_COMPLETE, verify Redis has:
+   - b_uuid populated
+   - has_rdnis flag set correctly
+   - forwarded_to set correctly
+
+3. **Compare with events.txt:** For Call 4, verify you capture:
+   - A-leg CHANNEL_CREATE: Unique-ID=b86b4b5a..., Caller-Destination-Number=8883336661
+   - B-leg CHANNEL_CREATE: Other-Leg-Unique-ID=b86b4b5a..., Caller-RDNIS=8883336661, Caller-Destination-Number=9885564228
+
+## Event Subscription
+
+Ensure you subscribe to these events in monitor.py:
+
+```python
+events = "CHANNEL_CREATE CHANNEL_ANSWER CHANNEL_BRIDGE CHANNEL_HANGUP_COMPLETE"
+```
+
+Note: Removed CHANNEL_PROGRESS if not needed, kept CHANNEL_BRIDGE to detect when B-leg connects.
+'''
+
+with open('/mnt/kimi/output/freeswitch_cdr_implementation_guide.txt', 'w') as f:
+    f.write(content)
+    
+print("File created: /mnt/kimi/output/freeswitch_cdr_implementation_guide.txt")
+print(f"Size: {len(content)} characters")
+</parameter>
+</invoke>
+</function_calls>
+
+I've created a comprehensive implementation guide for your VS Code Copilot. The file is saved at:
+
+**`/mnt/kimi/output/freeswitch_cdr_implementation_guide.txt`**
+
+The guide includes:
+
+1. **Architecture Overview** - Explains the A-leg vs B-leg tracking concept
+2. **Classification Rules** - The exact logic to distinguish INBOUND/OUTBOUND/DID_FORWARD
+3. **Database Mapping** - Which event fields map to which database columns
+4. **Complete Code** - Ready-to-implement functions for:
+   - `handle_create()` (modified to capture both legs)
+   - `is_internal()` helper
+   - `classify_call_type()` (the core logic)
+   - `handle_hangup_complete()` (modified for aggregation)
+5. **Redis Schema** - Data structure for state management
+6. **Validation Checklist** - Specific checks for your 4 scenarios from events.txt
+7. **Critical Field Explanation** - Deep dive on `Caller-RDNIS` (the key to detecting DID_FORWARD)
+
+The key insight for your Copilot: **DID_FORWARD is detected when the B-leg has `Caller-RDNIS` set**, which indicates the outbound call is a diversion/forward of the original DID, not a new outbound call from an extension.
