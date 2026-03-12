@@ -34,11 +34,11 @@ import greenswitch
 try:
     from . import config
     from .connections import init_connections, close_connections, health_check, redis_manager, postgres_manager
-    from .handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size
+    from .handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size, clear_customer_lookup_cache
 except ImportError:
     import config
     from connections import init_connections, close_connections, health_check, redis_manager, postgres_manager
-    from handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size
+    from handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size, clear_customer_lookup_cache
 
 
 # =============================================================================
@@ -252,6 +252,9 @@ def main():
     if not init_connections():
         logger.error("Failed to initialize connections")
         return 1
+    
+    # Clear old cached lookups to use fresh customer lookup logic
+    clear_customer_lookup_cache()
     
     # Start CDR background workers
     start_cdr_workers()

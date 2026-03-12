@@ -82,28 +82,47 @@ customer_cache = CustomerCache(config.CUSTOMER_CACHE_MAX_SIZE)
 @lru_cache(maxsize=1000)
 def _cached_customer_lookup(number: str) -> Optional[str]:
     """Cached database lookup for number to tenantid from tfns table.
-    Numbers in DB are stored with +1 prefix (e.g., +18884440000).
+    Numbers in DB can be stored in various formats: +18001231234, 18001231234, +1-800-123-1234, etc.
+    Try multiple variations to find match.
     """
     try:
         with get_customer_pg_connection() as conn:
             if not conn:
                 return None
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Numbers in tfns are stored with +1 prefix
-                # Try with +1 prefix first
-                search_number = f"+{number}" if not number.startswith('+') else number
+                # Generate all possible variations of the number to try
+                variations = set()
                 
-                # If number doesn't start with +1, add it
-                if not search_number.startswith('+1'):
-                    search_number = f"+1{number.lstrip('+')}"
+                # Remove all non-digit characters except leading +
+                clean_number = ''.join(c for c in number if c.isdigit())
                 
-                cur.execute("""
-                    SELECT "tenantId"
-                    FROM tfns
-                    WHERE number = %s
-                """, (search_number,))
-                result = cur.fetchone()
-                return result['tenantId'] if result else None
+                # If number is 10 digits (US/Canada), add +1 prefix
+                if len(clean_number) == 10:
+                    clean_number = '1' + clean_number
+                
+                # Try all variations
+                variations.add(clean_number)  # e.g., 18001231234
+                variations.add(f"+{clean_number}")  # e.g., +18001231234
+                variations.add(f"+1{clean_number.lstrip('1')}" if clean_number.startswith('1') else f"+1{clean_number}")
+                variations.add(number)  # Original
+                
+                # Try each variation
+                for search_number in variations:
+                    if not search_number:
+                        continue
+                    cur.execute("""
+                        SELECT "tenantId"
+                        FROM tfns
+                        WHERE number = %s
+                        LIMIT 1
+                    """, (search_number,))
+                    result = cur.fetchone()
+                    if result:
+                        logger.debug(f"Customer lookup matched {number} as {search_number}: {result['tenantId']}")
+                        return result['tenantId']
+                
+                logger.debug(f"Customer lookup found no match for {number} (tried: {', '.join(variations)})")
+                return None
     except Exception as e:
         logger.error(f"Customer lookup error for number {number}: {e}")
         return None
@@ -114,6 +133,12 @@ def get_customer_id_from_number(number: str) -> Optional[str]:
     if not number:
         return None
     return _cached_customer_lookup(number)
+
+
+def clear_customer_lookup_cache():
+    """Clear the customer lookup cache (call at startup to clear stale entries)."""
+    _cached_customer_lookup.cache_clear()
+    logger.info("Customer lookup cache cleared")
 
 
 # =============================================================================
@@ -167,14 +192,17 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
     Determine call type and return tuple:
     (call_type, dest_type, dest_value, egress_trunk)
     
-    Simplified Rules (per user request):
-    - INBOUND: External caller -> Internal extension
-    - OUTBOUND: Everything else (DID_FORWARD, OUTBOUND, INTERNAL all treated as OUTBOUND)
+    Call Type Rules:
+    - INBOUND: External caller -> Internal extension (no forwarding)
+    - DID_FORWARD: External caller -> External destination (forwarded call, has RDNIS)
+    - OUTBOUND: Internal extension -> External destination (user-initiated)
+    - INTERNAL: Internal extension -> Internal extension
     """
     b_uuid = a_leg_data.get("b_uuid")
     forwarded_to = a_leg_data.get("forwarded_to", "")
     original_callee = a_leg_data.get("callee", "")
     caller = a_leg_data.get("caller", "")
+    has_rdnis = a_leg_data.get("has_rdnis", "false") == "true"
     
     caller_internal = is_internal(caller)
     dest_internal = is_internal(forwarded_to)
@@ -185,13 +213,27 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
             return "INBOUND", "extension", original_callee, ""
         return "OUTBOUND", "unknown", "", ""
     
-    # Has B-leg - check if INBOUND or OUTBOUND
+    # === DID_FORWARD Detection ===
+    # External caller -> External destination + RDNIS present = forwarded call
+    if not caller_internal and not dest_internal and has_rdnis:
+        return "DID_FORWARD", "external", forwarded_to, forwarded_to
+    
+    # === INBOUND Detection ===
+    # External caller -> Internal extension = answered internally
     if not caller_internal and dest_internal:
-        # External caller to internal extension = INBOUND
         return "INBOUND", "extension", forwarded_to, ""
     
-    # Everything else = OUTBOUND
-    # This includes: DID_FORWARD, extension->external, extension->extension
+    # === OUTBOUND Detection ===
+    # Internal extension -> External destination (user-initiated outbound)
+    if caller_internal and not dest_internal:
+        return "OUTBOUND", "external", forwarded_to, forwarded_to
+    
+    # === INTERNAL Detection ===
+    # Internal extension -> Internal extension
+    if caller_internal and dest_internal:
+        return "INTERNAL", "extension", forwarded_to, ""
+    
+    # Fallback
     dest_type = "extension" if dest_internal else "external"
     return "OUTBOUND", dest_type, forwarded_to, forwarded_to
 
