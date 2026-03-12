@@ -135,9 +135,42 @@ def get_customer_id_from_number(number: str) -> Optional[str]:
     return _cached_customer_lookup(number)
 
 
+@lru_cache(maxsize=1000)
+def _cached_extension_lookup(extension: str) -> Optional[str]:
+    """Cached database lookup for extension number to tenantId from extensions table."""
+    try:
+        with get_customer_pg_connection() as conn:
+            if not conn:
+                return None
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT "tenantId"
+                    FROM extensions
+                    WHERE "extensionNumber" = %s
+                    LIMIT 1
+                """, (extension,))
+                result = cur.fetchone()
+                if result:
+                    logger.debug(f"Extension lookup matched {extension}: {result['tenantId']}")
+                    return result['tenantId']
+                logger.debug(f"Extension lookup found no match for {extension}")
+                return None
+    except Exception as e:
+        logger.error(f"Extension lookup error for {extension}: {e}")
+        return None
+
+
+def get_customer_id_from_extension(extension: str) -> Optional[str]:
+    """Get customer_id (tenantId) from extension number via extensions table lookup."""
+    if not extension:
+        return None
+    return _cached_extension_lookup(extension)
+
+
 def clear_customer_lookup_cache():
     """Clear the customer lookup cache (call at startup to clear stale entries)."""
     _cached_customer_lookup.cache_clear()
+    _cached_extension_lookup.cache_clear()
     logger.info("Customer lookup cache cleared")
 
 
@@ -584,7 +617,12 @@ def handle_create(event_dict: Dict[str, str]):
             ingress = (event_dict.get("variable_sip_received_ip") or 
                       event_dict.get("Caller-Network-Addr", ""))
             
-            customer_id = get_customer_id_from_number(callee) or ""
+            # Lookup customer_id: use extension table for outbound (internal caller),
+            # tfns table for inbound/DID_FORWARD (external caller with DID)
+            if is_internal(caller):
+                customer_id = get_customer_id_from_extension(caller) or ""
+            else:
+                customer_id = get_customer_id_from_number(callee) or ""
             
             call_data = {
                 "uuid": uuid,
