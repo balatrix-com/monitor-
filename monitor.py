@@ -33,11 +33,11 @@ import greenswitch
 # Local imports - work both as package and direct run
 try:
     from . import config
-    from .connections import init_connections, close_connections, health_check, redis_manager, postgres_manager
+    from .connections import init_connections, close_connections, health_check, redis_manager, lookup_redis_manager, postgres_manager
     from .handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size, clear_customer_lookup_cache
 except ImportError:
     import config
-    from connections import init_connections, close_connections, health_check, redis_manager, postgres_manager
+    from connections import init_connections, close_connections, health_check, redis_manager, lookup_redis_manager, postgres_manager
     from handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size, clear_customer_lookup_cache
 
 
@@ -131,6 +131,7 @@ def health_check_loop():
                     f"active={active} cache={customer_cache.size()} "
                     f"cdr_queue={get_cdr_queue_size()} "
                     f"redis={'✓' if health['redis'] else '✗'} "
+                    f"lookup_redis={'✓' if health['lookup_redis'] else '✗'} "
                     f"pg={'✓' if health['postgres'] else '✗'}"
                 )
                 last_heartbeat = now
@@ -142,6 +143,7 @@ def health_check_loop():
             
             # Ensure connections
             redis_manager.ensure_connected()
+            lookup_redis_manager.ensure_connected()
             postgres_manager.ensure_connected()
             
             gevent.sleep(config.HEALTH_CHECK_INTERVAL)

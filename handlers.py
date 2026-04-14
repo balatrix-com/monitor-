@@ -14,15 +14,13 @@ import sqlite3
 from typing import Dict, Optional, Any
 from functools import lru_cache
 
-from psycopg2.extras import RealDictCursor
-
 # Local imports - work both as package and direct run
 try:
     from . import config
-    from .connections import get_redis, get_pg_connection, get_customer_pg_connection
+    from .connections import get_redis, get_lookup_redis, get_pg_connection
 except ImportError:
     import config
-    from connections import get_redis, get_pg_connection, get_customer_pg_connection
+    from connections import get_redis, get_lookup_redis, get_pg_connection
 
 logger = logging.getLogger("monitor.handlers")
 
@@ -82,55 +80,34 @@ customer_cache = CustomerCache(config.CUSTOMER_CACHE_MAX_SIZE)
 
 @lru_cache(maxsize=1000)
 def _cached_customer_lookup(number: str) -> Optional[str]:
-    """Cached database lookup for number to tenantid from tfns table.
-    Numbers in DB can be stored in various formats: +18001231234, 18001231234, +1-800-123-1234, etc.
-    Try multiple variations to find match.
+    """Cached Redis lookup for number -> customer_id.
+
+    Lookup key format: lookup:v1:number:<normalized_number>
+    where normalized_number is digits-only without + or country prefix.
     """
+    lookup_redis = get_lookup_redis()
+    if not lookup_redis:
+        return None
+
     try:
-        with get_customer_pg_connection() as conn:
-            if not conn:
-                return None
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Generate all possible variations of the number to try
-                variations = set()
-                
-                # Remove all non-digit characters except leading +
-                clean_number = ''.join(c for c in number if c.isdigit())
-                
-                # If number is 10 digits (US/Canada), add +1 prefix
-                if len(clean_number) == 10:
-                    clean_number = '1' + clean_number
-                
-                # Try all variations
-                variations.add(clean_number)  # e.g., 18001231234
-                variations.add(f"+{clean_number}")  # e.g., +18001231234
-                variations.add(f"+1{clean_number.lstrip('1')}" if clean_number.startswith('1') else f"+1{clean_number}")
-                variations.add(number)  # Original
-                
-                # Try each variation
-                for search_number in variations:
-                    if not search_number:
-                        continue
-                    cur.execute("""
-                        SELECT "tenantId"
-                        FROM tfns
-                        WHERE number = %s
-                        LIMIT 1
-                    """, (search_number,))
-                    result = cur.fetchone()
-                    if result:
-                        logger.debug(f"Customer lookup matched {number} as {search_number}: {result['tenantId']}")
-                        return result['tenantId']
-                
-                logger.debug(f"Customer lookup found no match for {number} (tried: {', '.join(variations)})")
-                return None
+        digits = ''.join(c for c in number if c.isdigit())
+        if not digits:
+            return None
+
+        # Redis lookup uses local number format (e.g. 8005550100), not +1/1 prefixes.
+        normalized = digits[1:] if len(digits) == 11 and digits.startswith('1') else digits
+        key = f"{config.LOOKUP_REDIS_NUMBER_KEY_PREFIX}:{normalized}"
+        customer_id = lookup_redis.get(key)
+        if customer_id:
+            logger.debug(f"Lookup Redis number matched {number} as {normalized}: {customer_id}")
+        return customer_id
     except Exception as e:
-        logger.error(f"Customer lookup error for number {number}: {e}")
+        logger.error(f"Lookup Redis number error for {number}: {e}")
         return None
 
 
 def get_customer_id_from_number(number: str) -> Optional[str]:
-    """Get customer_id (tenentid) from number via tfns table lookup."""
+    """Get customer_id from lookup Redis number key."""
     if not number:
         return None
     return _cached_customer_lookup(number)
@@ -138,31 +115,33 @@ def get_customer_id_from_number(number: str) -> Optional[str]:
 
 @lru_cache(maxsize=1000)
 def _cached_extension_lookup(extension: str) -> Optional[str]:
-    """Cached database lookup for extension number to tenantId from extensions table."""
+    """Cached Redis lookup for extension-prefix -> customer_id.
+
+    Example: extension 000601 resolves with key lookup:v1:ext:0006
+    """
+    lookup_redis = get_lookup_redis()
+    if not lookup_redis:
+        return None
+
     try:
-        with get_customer_pg_connection() as conn:
-            if not conn:
-                return None
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT "tenantId"
-                    FROM extensions
-                    WHERE "extensionNumber" = %s
-                    LIMIT 1
-                """, (extension,))
-                result = cur.fetchone()
-                if result:
-                    logger.debug(f"Extension lookup matched {extension}: {result['tenantId']}")
-                    return result['tenantId']
-                logger.debug(f"Extension lookup found no match for {extension}")
-                return None
+        digits = ''.join(c for c in extension if c.isdigit())
+        if not digits:
+            return None
+
+        prefix_len = max(1, int(getattr(config, 'LOOKUP_EXTENSION_PREFIX_LEN', 4)))
+        prefix = digits[:prefix_len]
+        key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{prefix}"
+        customer_id = lookup_redis.get(key)
+        if customer_id:
+            logger.debug(f"Lookup Redis extension matched {extension} as {prefix}: {customer_id}")
+        return customer_id
     except Exception as e:
-        logger.error(f"Extension lookup error for {extension}: {e}")
+        logger.error(f"Lookup Redis extension error for {extension}: {e}")
         return None
 
 
 def get_customer_id_from_extension(extension: str) -> Optional[str]:
-    """Get customer_id (tenantId) from extension number via extensions table lookup."""
+    """Get customer_id from lookup Redis extension-prefix key."""
     if not extension:
         return None
     return _cached_extension_lookup(extension)

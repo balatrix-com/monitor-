@@ -59,6 +59,20 @@ REDIS_HEALTH_CHECK_INTERVAL = _env_int("REDIS_HEALTH_CHECK_INTERVAL", 30)
 # Redis key settings
 REDIS_CALL_TTL = _env_int("REDIS_CALL_TTL", 86400)  # 24 hours
 
+# Lookup Redis configuration (managed by external sync service)
+LOOKUP_REDIS_HOST = _env("LOOKUP_REDIS_HOST", "10.30.0.2")
+LOOKUP_REDIS_PORT = _env_int("LOOKUP_REDIS_PORT", 6379)
+LOOKUP_REDIS_DB = _env_int("LOOKUP_REDIS_DB", 2)
+LOOKUP_REDIS_PASSWORD = _env("LOOKUP_REDIS_PASSWORD", "OnidaMaruti1)")
+LOOKUP_REDIS_SOCKET_TIMEOUT = _env_int("LOOKUP_REDIS_SOCKET_TIMEOUT", 5
+LOOKUP_REDIS_MAX_CONNECTIONS = _env_int("LOOKUP_REDIS_MAX_CONNECTIONS", 100)
+LOOKUP_REDIS_HEALTH_CHECK_INTERVAL = _env_int("LOOKUP_REDIS_HEALTH_CHECK_INTERVAL", 30)
+
+# Lookup key format settings
+LOOKUP_REDIS_NUMBER_KEY_PREFIX = _env("LOOKUP_REDIS_NUMBER_KEY_PREFIX", "lookup:v1:number")
+LOOKUP_REDIS_EXT_KEY_PREFIX = _env("LOOKUP_REDIS_EXT_KEY_PREFIX", "lookup:v1:ext")
+LOOKUP_EXTENSION_PREFIX_LEN = _env_int("LOOKUP_EXTENSION_PREFIX_LEN", 4)
+
 
 # =============================================================================
 # POSTGRESQL CONFIGURATION (CDR / live_call_events)
