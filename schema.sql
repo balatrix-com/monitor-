@@ -1,26 +1,8 @@
 -- PostgreSQL schema for FreeSWITCH call monitoring
 
--- TollFreeNumbers table (if not exists)
-CREATE TABLE IF NOT EXISTS "TollFreeNumbers" (
-    id SERIAL PRIMARY KEY,
-    number VARCHAR(50) UNIQUE NOT NULL,
-    config JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
 
-CREATE INDEX IF NOT EXISTS idx_tollfreenumbers_number ON "TollFreeNumbers"(number);
-CREATE INDEX IF NOT EXISTS idx_tollfreenumbers_config ON "TollFreeNumbers" USING gin(config);
 
--- Subscriptions table (if not exists)
-CREATE TABLE IF NOT EXISTS subscriptions (
-    "subscriptionId" UUID PRIMARY KEY,
-    "customerId" UUID NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
 
-CREATE INDEX IF NOT EXISTS idx_subscriptions_customerid ON subscriptions("customerId");
 
 -- Live call events history table (CDR-style)
 -- Stores ONE record per call/leg (on hangup), not every event
@@ -32,7 +14,7 @@ CREATE TABLE IF NOT EXISTS live_call_events (
     event_ts BIGINT NOT NULL,  -- Hangup timestamp
     caller VARCHAR(100),
     callee VARCHAR(100),
-    customer_id UUID,
+    customer_id VARCHAR(50),
     dest_type VARCHAR(50),
     dest_value VARCHAR(100),
     status_code VARCHAR(50),  -- Hangup cause code
@@ -42,20 +24,13 @@ CREATE TABLE IF NOT EXISTS live_call_events (
     originating_leg_uuid VARCHAR(100),  -- Reference to A-leg for DID forwards (B-leg only)
     ingress_trunk VARCHAR(100),  -- Source trunk/gateway
     egress_trunk VARCHAR(100),  -- Destination trunk/gateway
-    gateway_id VARCHAR(100),  -- Gateway used
     duration INTEGER DEFAULT 0,  -- Total call duration in seconds (from create to hangup)
     billsec INTEGER DEFAULT 0,  -- Billable duration in seconds (from answer to hangup)
-    currency VARCHAR(3) DEFAULT 'USD',  -- Currency code for billing (default USD)
-    transaction_id BIGINT DEFAULT 0,  -- Transaction ID for billing system
-    is_rated BOOLEAN DEFAULT false,  -- Whether call has been rated/processed for billing
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_live_call_events_uuid ON live_call_events(uuid);
-CREATE INDEX IF NOT EXISTS idx_live_call_events_customer_id ON live_call_events(customer_id);
-CREATE INDEX IF NOT EXISTS idx_live_call_events_event_ts ON live_call_events(event_ts);
-CREATE INDEX IF NOT EXISTS idx_live_call_events_caller ON live_call_events(caller);
-CREATE INDEX IF NOT EXISTS idx_live_call_events_callee ON live_call_events(callee);
+-- Keep only the UNIQUE constraint index on uuid for hot write performance.
+-- Additional secondary indexes can be added later based on confirmed query needs.
 
 -- Sample data for testing
 -- INSERT INTO "TollFreeNumbers" (number, config) VALUES 

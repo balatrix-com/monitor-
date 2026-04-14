@@ -10,6 +10,7 @@ import logging
 import time
 import queue
 import threading
+import sqlite3
 from typing import Dict, Optional, Any
 from functools import lru_cache
 
@@ -18,7 +19,7 @@ from psycopg2.extras import RealDictCursor
 # Local imports - work both as package and direct run
 try:
     from . import config
-    from .connections import get_redis, get_pg_connection
+    from .connections import get_redis, get_pg_connection, get_customer_pg_connection
 except ImportError:
     import config
     from connections import get_redis, get_pg_connection, get_customer_pg_connection
@@ -367,6 +368,90 @@ def remove_call_from_redis(uuid: str, customer_id: str):
 # CDR BATCHER FOR PHASE 1 SCALING (300-400 CC)
 # =============================================================================
 
+
+class CDRSpool:
+    """Durable local spool for zero-loss CDR buffering."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _connect(self):
+        return sqlite3.connect(self.db_path, timeout=30)
+
+    def _init_db(self):
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cdr_spool (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def enqueue(self, cdr: Dict[str, Any]) -> int:
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO cdr_spool (payload, created_ts) VALUES (?, ?)",
+                (json.dumps(cdr, separators=(",", ":")), int(time.time()))
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    def fetch_batch(self, limit: int) -> list:
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, payload FROM cdr_spool ORDER BY id ASC LIMIT ?",
+                (limit,)
+            )
+            rows = cur.fetchall()
+            parsed = []
+            for row_id, payload in rows:
+                try:
+                    parsed.append((int(row_id), json.loads(payload)))
+                except Exception:
+                    # Skip malformed payloads but keep record for manual recovery.
+                    logger.error(f"Malformed CDR spool payload id={row_id}")
+            return parsed
+        finally:
+            conn.close()
+
+    def delete_batch(self, row_ids: list):
+        if not row_ids:
+            return
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            placeholders = ",".join(["?"] * len(row_ids))
+            cur.execute(
+                f"DELETE FROM cdr_spool WHERE id IN ({placeholders})",
+                tuple(row_ids)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def size(self) -> int:
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM cdr_spool")
+            row = cur.fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            conn.close()
+
 class CDRBatcher:
     """Batch CDRs for bulk insert - reduces DB load for high CC."""
     
@@ -376,58 +461,126 @@ class CDRBatcher:
         self.timeout = timeout
         self.last_flush = time.time()
         self.lock = threading.Lock()
+        self._flush_interval = max(0.1, getattr(config, 'CDR_FLUSH_INTERVAL', 0.5))
+        self._max_retries = max(1, getattr(config, 'CDR_INSERT_MAX_RETRIES', 5))
+        self._retry_backoff = max(0.1, getattr(config, 'CDR_INSERT_RETRY_BACKOFF', 0.5))
+        self._stop_event = threading.Event()
+        self._flush_event = threading.Event()
+        self._flusher_started = False
+        self._use_durable_spool = getattr(config, 'CDR_DURABLE_SPOOL_ENABLED', True)
+        self._spool = CDRSpool(getattr(config, 'CDR_SPOOL_DB_PATH', 'cdr_spool.db')) if self._use_durable_spool else None
+
+    def start(self):
+        """Start periodic flusher loop once."""
+        if self._flusher_started:
+            return
+        t = threading.Thread(target=self._flusher_loop, daemon=True, name="cdr-flusher")
+        t.start()
+        self._flusher_started = True
+        logger.info(
+            f"CDR flusher started (batch={self.batch_size}, timeout={self.timeout}s, durable_spool={self._use_durable_spool})"
+        )
+
+    def _flusher_loop(self):
+        while not self._stop_event.is_set():
+            self._flush_event.wait(timeout=self._flush_interval)
+            self._flush_event.clear()
+            try:
+                self.flush()
+            except Exception as e:
+                logger.error(f"CDR periodic flush error: {e}")
     
     def add(self, cdr: Dict[str, Any]):
         """Add CDR to batch, flush if needed."""
+        if self._use_durable_spool and self._spool:
+            row_id = self._spool.enqueue(cdr)
+            if row_id % self.batch_size == 0:
+                self._flush_event.set()
+            return
+
         with self.lock:
             self.batch.append(cdr)
-            
-            # Flush if batch full
+
             if len(self.batch) >= self.batch_size:
-                self._flush_internal()
-            # Flush if timeout exceeded
+                batch_to_save = self.batch.copy()
+                self.batch = []
+                self.last_flush = time.time()
             elif time.time() - self.last_flush >= self.timeout:
-                self._flush_internal()
-    
-    def _flush_internal(self):
-        """Internal flush (must hold lock)."""
-        if self.batch:
-            batch_to_save = self.batch.copy()
-            self.batch = []
-            self.last_flush = time.time()
-            # Don't hold lock during DB write
-            self._bulk_insert_to_db(batch_to_save)
+                batch_to_save = self.batch.copy()
+                self.batch = []
+                self.last_flush = time.time()
+            else:
+                batch_to_save = []
+
+        if batch_to_save:
+            self._bulk_insert_with_retry(batch_to_save)
     
     def flush(self):
         """Force flush remaining CDRs."""
+        if self._use_durable_spool and self._spool:
+            while True:
+                rows = self._spool.fetch_batch(self.batch_size)
+                if not rows:
+                    return
+                row_ids = [row_id for row_id, _ in rows]
+                cdrs = [payload for _, payload in rows]
+
+                if self._bulk_insert_with_retry(cdrs):
+                    self._spool.delete_batch(row_ids)
+                else:
+                    # Keep rows in spool for retry in next flush cycle.
+                    return
+
+                if len(rows) < self.batch_size:
+                    return
+
         with self.lock:
-            self._flush_internal()
+            if not self.batch:
+                return
+            batch_to_save = self.batch.copy()
+            self.batch = []
+            self.last_flush = time.time()
+
+        self._bulk_insert_with_retry(batch_to_save)
+
+    def _bulk_insert_with_retry(self, cdrs: list) -> bool:
+        """Retry bulk insert with backoff. Keeps zero-loss durability with spool."""
+        for attempt in range(1, self._max_retries + 1):
+            if self._bulk_insert_to_db(cdrs):
+                return True
+            delay = self._retry_backoff * attempt
+            logger.warning(
+                f"Bulk insert retry {attempt}/{self._max_retries} in {delay:.1f}s for {len(cdrs)} CDRs"
+            )
+            time.sleep(delay)
+
+        logger.error(f"Bulk insert failed after retries for {len(cdrs)} CDRs")
+        return False
     
     def _bulk_insert_to_db(self, cdrs: list):
         """Bulk insert CDRs to database."""
         if not cdrs:
-            return
+            return True
         
         try:
             with get_pg_connection() as conn:
                 if not conn:
                     logger.error("Cannot get DB connection for bulk insert")
-                    return
+                    return False
                 
                 with conn.cursor() as cur:
                     # Build multi-row VALUES clause
                     placeholders = []
                     values = []
                     
-                    for i, cdr in enumerate(cdrs):
-                        # Each CDR has 22 parameters
-                        idx = i * 22
-                        placeholders.append(f"(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+                    for cdr in cdrs:
+                        # Each CDR has 18 parameters
+                        placeholders.append(f"(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
                         
                         values.extend([
                             cdr.get("uuid"),
                             cdr.get("b_uuid") or None,
-                            cdr.get("call_status"),
+                            cdr.get("event_type") or cdr.get("call_status"),
                             cdr.get("event_ts") or cdr.get("start_ts"),
                             cdr.get("caller"),
                             cdr.get("callee"),
@@ -441,12 +594,8 @@ class CDRBatcher:
                             cdr.get("originating_leg_uuid") or None,
                             cdr.get("ingress_trunk") or None,
                             cdr.get("egress_trunk") or None,
-                            cdr.get("gateway_id") or None,
                             int(cdr.get("duration", 0)),
-                            int(cdr.get("billsec", 0)),
-                            cdr.get("currency", "USD"),
-                            int(cdr.get("transaction_id", 0)),
-                            cdr.get("is_rated", False)
+                            int(cdr.get("billsec", 0))
                         ])
                     
                     # Single bulk insert
@@ -455,8 +604,8 @@ class CDRBatcher:
                         (uuid, b_uuid, event_type, event_ts, caller, callee, 
                          customer_id, dest_type, dest_value, status_code, 
                          call_type, outbound_caller_id, originating_extension, 
-                         originating_leg_uuid, ingress_trunk, egress_trunk, gateway_id, 
-                         duration, billsec, currency, transaction_id, is_rated)
+                         originating_leg_uuid, ingress_trunk, egress_trunk, 
+                         duration, billsec)
                         VALUES {','.join(placeholders)}
                         ON CONFLICT (uuid) DO NOTHING
                     """
@@ -464,9 +613,18 @@ class CDRBatcher:
                     cur.execute(query, values)
                     conn.commit()
                     logger.info(f"Bulk inserted {len(cdrs)} CDRs in 1 query")
+                    return True
                     
         except Exception as e:
             logger.error(f"Bulk insert error: {e}")
+            return False
+
+    def pending_count(self) -> int:
+        """Approximate pending records waiting to be inserted."""
+        if self._use_durable_spool and self._spool:
+            return self._spool.size()
+        with self.lock:
+            return len(self.batch)
 
 
 # Global batcher instance
@@ -549,34 +707,35 @@ def _cdr_worker_thread(worker_id: int):
 
 
 def start_cdr_workers():
-    """Start background CDR worker threads."""
+    """Start background CDR batching/flusher worker."""
     global _cdr_workers_started
     if _cdr_workers_started:
         return
-    
-    num_workers = getattr(config, 'CDR_QUEUE_WORKERS', 3)
-    for i in range(num_workers):
-        t = threading.Thread(target=_cdr_worker_thread, args=(i+1,), daemon=True)
-        t.start()
-    
+
+    cdr_batcher.start()
     _cdr_workers_started = True
-    logger.info(f"Started {num_workers} CDR worker threads")
+    logger.info("Started CDR batch flusher")
 
 
 def save_cdr_to_postgres(call_data: Dict[str, Any]) -> bool:
-    """Queue CDR for async saving to PostgreSQL via batcher (non-blocking)."""
+    """Save CDR to durable spool for guaranteed zero-loss."""
     try:
-        # Use batcher for Phase 1 scaling (auto batches and flushes)
+        # Always use durable spool for zero-loss guarantee
+        if cdr_batcher._use_durable_spool and cdr_batcher._spool:
+            cdr_batcher._spool.enqueue(call_data.copy())
+            return True
+        
+        # Fallback if spool disabled: use in-memory batcher
         cdr_batcher.add(call_data.copy())
         return True
     except Exception as e:
-        logger.error(f"CDR batcher error: {e}")
+        logger.error(f"CDR save error: {e}")
         return False
 
 
 def get_cdr_queue_size() -> int:
     """Get current CDR queue size (for monitoring)."""
-    return cdr_queue.qsize()
+    return cdr_batcher.pending_count()
 
 
 # =============================================================================
@@ -825,11 +984,7 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
             "billsec": billsec,
             "ingress_trunk": redis_data.get("ingress_trunk"),
             "egress_trunk": egress_trunk or event_dict.get("variable_default_gateway", ""),
-            "gateway_id": event_dict.get("variable_sofia_profile_name", ""),
             "call_status": "hangup",
-            "currency": "USD",  # Default currency for billing
-            "transaction_id": 0,  # Will be set by billing service
-            "is_rated": False,  # Will be set by billing service
         }
         
         # Type-specific fields

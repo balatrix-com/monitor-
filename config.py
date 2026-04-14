@@ -70,10 +70,11 @@ PG_DATABASE = _env("PG_DATABASE", "frendsahil")
 PG_USER = _env("PG_USER", "frend1")
 PG_PASSWORD = _env("PG_PASSWORD", "SolidMasti1!")
 
-# PostgreSQL pool settings (Phase 1: 300-400 CC)
-PG_MIN_CONNECTIONS = _env_int("PG_MIN_CONNECTIONS", 10)
-PG_MAX_CONNECTIONS = _env_int("PG_MAX_CONNECTIONS", 200)  # Phase 1: 6.7x increase for 300-400 CC
-PG_CONNECT_TIMEOUT = _env_int("PG_CONNECT_TIMEOUT", 5)  # Phase 1: Faster timeout
+# PostgreSQL pool settings
+# Keep this conservative for shared DB (total max_connections=150 across services).
+PG_MIN_CONNECTIONS = _env_int("PG_MIN_CONNECTIONS", 5)
+PG_MAX_CONNECTIONS = _env_int("PG_MAX_CONNECTIONS", 15)
+PG_CONNECT_TIMEOUT = _env_int("PG_CONNECT_TIMEOUT", 5)
 
 
 # =============================================================================
@@ -93,11 +94,11 @@ CUSTOMER_PG_MAX_CONNECTIONS = _env_int("CUSTOMER_PG_MAX_CONNECTIONS", 50)
 # PERFORMANCE SETTINGS
 # =============================================================================
 
-# Worker pool for event processing (Phase 1: 300-400 CC)
-EVENT_WORKER_POOL_SIZE = _env_int("EVENT_WORKER_POOL_SIZE", 500)  # Phase 1: 4x increase
+# Worker pool for event processing
+EVENT_WORKER_POOL_SIZE = _env_int("EVENT_WORKER_POOL_SIZE", 250)
 
-# CDR async queue settings (Phase 1: 300-400 CC)
-CDR_QUEUE_WORKERS = _env_int("CDR_QUEUE_WORKERS", 100)  # Phase 1: 10x increase for batched inserts
+# Legacy CDR queue worker setting (not used by spool batcher path)
+CDR_QUEUE_WORKERS = _env_int("CDR_QUEUE_WORKERS", 10)
 
 # Event queue settings
 EVENT_QUEUE_MAX_SIZE = _env_int("EVENT_QUEUE_MAX_SIZE", 1000)
@@ -131,6 +132,15 @@ LOG_DEBUG_EVENTS = _env_bool("LOG_DEBUG_EVENTS", False)
 # CDR SETTINGS
 # =============================================================================
 
-# Batch CDR inserts for performance (Phase 1: 300-400 CC)
-CDR_BATCH_SIZE = _env_int("CDR_BATCH_SIZE", 50)  # Phase 1: Batch 50 CDRs at once
-CDR_BATCH_TIMEOUT = _env_int("CDR_BATCH_TIMEOUT", 2)  # Phase 1: Flush every 2 seconds
+# Batch CDR inserts for performance and durability.
+CDR_BATCH_SIZE = _env_int("CDR_BATCH_SIZE", 50)
+CDR_BATCH_TIMEOUT = _env_int("CDR_BATCH_TIMEOUT", 4)
+
+# Durable local spool for zero-loss without external MQ.
+CDR_DURABLE_SPOOL_ENABLED = _env_bool("CDR_DURABLE_SPOOL_ENABLED", True)
+CDR_SPOOL_DB_PATH = _env("CDR_SPOOL_DB_PATH", str(BASE_DIR / "cdr_spool.db"))
+
+# Insert retry and periodic flush controls.
+CDR_INSERT_MAX_RETRIES = _env_int("CDR_INSERT_MAX_RETRIES", 8)
+CDR_INSERT_RETRY_BACKOFF = float(_env("CDR_INSERT_RETRY_BACKOFF", "0.5"))
+CDR_FLUSH_INTERVAL = float(_env("CDR_FLUSH_INTERVAL", "0.5"))
