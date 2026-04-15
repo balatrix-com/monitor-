@@ -338,7 +338,17 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
             pipe.sadd("active_calls", uuid)
         
         pipe.publish("calls_stream", json.dumps(call_data))
-        pipe.execute()
+        results = pipe.execute()
+
+        # Basic sanity check: hash key and index key should exist after write.
+        # Keep this lightweight and only do extra checks when debug events are enabled.
+        if getattr(config, "LOG_DEBUG_EVENTS", False):
+            hash_exists = redis_client.exists(key)
+            idx_exists = redis_client.exists(idx_key)
+            logger.debug(
+                f"Redis upsert ok uuid={uuid[:8]}... customer={customer_id} "
+                f"key_exists={bool(hash_exists)} idx_exists={bool(idx_exists)} results={results}"
+            )
         
         customer_cache.set(uuid, customer_id)
         return True
@@ -487,6 +497,11 @@ def remove_call_from_redis(uuid: str, customer_id: str):
         pipe.delete(idx_key)
         pipe.srem("active_calls", uuid)
         pipe.execute()
+        if getattr(config, "LOG_DEBUG_EVENTS", False):
+            logger.debug(
+                f"Redis cleanup uuid={uuid[:8]}... indexed_customer={indexed_customer or 'none'} "
+                f"requested_customer={customer_id or 'none'}"
+            )
         customer_cache.remove(uuid)
     except Exception as e:
         logger.error(f"Redis remove error: {e}")
@@ -929,7 +944,10 @@ def handle_create(event_dict: Dict[str, str]):
                 "answer_ts": "",
             }
             
-            store_call_in_redis(call_data)
+            if not store_call_in_redis(call_data):
+                stats.error()
+                logger.error(f"CREATE A-leg state store failed: {uuid[:8]}... {caller} -> {callee}")
+                return
             logger.info(f"CREATE A-leg: {uuid[:8]}... {caller} -> {callee}")
             
         elif other_leg:
@@ -957,7 +975,10 @@ def handle_create(event_dict: Dict[str, str]):
                 a_leg["originating_extension"] = a_leg["caller"]
                 a_leg["outbound_caller_id"] = b_caller_id
                 
-            store_call_in_redis(a_leg)
+            if not store_call_in_redis(a_leg):
+                stats.error()
+                logger.error(f"CREATE B-leg state store failed: {uuid[:8]}... -> {b_dest}")
+                return
             logger.info(f"CREATE B-leg: {uuid[:8]}... -> {b_dest} (RDNIS: {rdnis or 'none'})")
             
     except Exception as e:
@@ -979,7 +1000,10 @@ def handle_progress(event_dict: Dict[str, str]):
             return
         
         call_data["call_status"] = "ringing"
-        store_call_in_redis(call_data)
+        if not store_call_in_redis(call_data):
+            stats.error()
+            logger.error(f"PROGRESS state store failed: {uuid[:8]}...")
+            return
         stats.increment()
         logger.debug(f"PROGRESS: {uuid[:8]}... ringing")
         
@@ -1005,7 +1029,10 @@ def handle_answer(event_dict: Dict[str, str]):
         call_data["dest_type"] = dest_type
         call_data["dest_value"] = dest_value
         
-        store_call_in_redis(call_data)
+        if not store_call_in_redis(call_data):
+            stats.error()
+            logger.error(f"ANSWER state store failed: {uuid[:8]}...")
+            return
         stats.increment()
         logger.info(f"ANSWER: {uuid[:8]}... -> {dest_type}:{dest_value}")
         
@@ -1037,7 +1064,10 @@ def handle_bridge(event_dict: Dict[str, str]):
             if not call_data.get("answer_ts") or call_data.get("answer_ts") == "":
                 call_data["answer_ts"] = str(bridge_ts)
             
-            store_call_in_redis(call_data)
+            if not store_call_in_redis(call_data):
+                stats.error()
+                logger.error(f"BRIDGE state store failed: {uuid[:8]}... -> {b_uuid[:8]}...")
+                return
             stats.increment()
             logger.info(f"BRIDGE: {uuid[:8]}... -> {b_uuid[:8]}... ({dest_type}:{dest_value})")
         
