@@ -172,6 +172,7 @@ def is_internal(number: str) -> bool:
 def determine_destination(event_data: Dict[str, str]) -> tuple:
     """Determine destination type and value from event data."""
     bridge_to = (
+        event_data.get("Caller-Callee-ID-Number") or
         event_data.get("Other-Leg-Destination-Number") or
         event_data.get("variable_bridge_to") or 
         event_data.get("variable_sip_req_user") or
@@ -251,6 +252,33 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
     # Fallback
     dest_type = "extension" if dest_internal else "external"
     return "OUTBOUND", dest_type, forwarded_to, forwarded_to
+
+
+def _normalize_did_value(value: str) -> str:
+    """Normalize DID-like values by extracting digits when possible."""
+    if not value:
+        return ""
+    digits = ''.join(c for c in value if c.isdigit())
+    if len(digits) >= 7:
+        return digits
+    return value
+
+
+def _preferred_cdr_callee(redis_data: Dict[str, str]) -> str:
+    """Pick stable callee value (prefer original DID, fallback to initial callee)."""
+    original_did = redis_data.get("original_did", "") or ""
+    callee = redis_data.get("callee", "") or ""
+
+    normalized_original = _normalize_did_value(original_did)
+    normalized_callee = _normalize_did_value(callee)
+
+    # Keep true DID when available; avoid routing labels like sched1_0006/ext2_0006.
+    if normalized_original and normalized_original.isdigit() and len(normalized_original) >= 7:
+        return normalized_original
+    if normalized_callee and normalized_callee.isdigit() and len(normalized_callee) >= 7:
+        return normalized_callee
+
+    return callee or original_did
 
 
 # =============================================================================
@@ -847,16 +875,16 @@ def handle_create(event_dict: Dict[str, str]):
                 
             # Capture forward indicators
             rdnis = event_dict.get("Caller-RDNIS", "")  # KEY FIELD for DID_FORWARD
-            b_dest = event_dict.get("Caller-Destination-Number", "")
+            b_dest = (
+                event_dict.get("Caller-Callee-ID-Number") or
+                event_dict.get("Caller-Destination-Number", "")
+            )
             b_caller_id = event_dict.get("Caller-Caller-ID-Number", "")
             
             # Update A-leg record with B-leg info
             a_leg["b_uuid"] = uuid
             a_leg["forwarded_to"] = b_dest
             a_leg["has_rdnis"] = "true" if rdnis else "false"
-            
-            if rdnis:
-                a_leg["original_did"] = rdnis  # Confirm original DID
                 
             # For outbound calls, store the originating extension
             if is_internal(a_leg.get("caller", "")):
@@ -1012,6 +1040,15 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
         
         # Classify call type using RDNIS detection
         call_type, dest_type, dest_value, egress_trunk = classify_call_type(redis_data)
+
+        # If extension routing failed and IVR answered afterwards, do not mark as answered.
+        dialstatus = (event_dict.get("variable_DIALSTATUS") or "").upper()
+        originate_disposition = (event_dict.get("variable_originate_disposition") or "").upper()
+        if call_type == "INBOUND" and event_type == "answered":
+            if (dialstatus and dialstatus not in ["SUCCESS", "ANSWER"]) or (
+                originate_disposition and originate_disposition != "SUCCESS"
+            ):
+                event_type = "no_answer"
         
         # Build CDR
         cdr = {
@@ -1020,7 +1057,7 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
             "event_type": event_type,
             "event_ts": hangup_ts,
             "caller": redis_data.get("caller"),
-            "callee": redis_data.get("original_did", redis_data.get("callee")),  # Use original DID
+            "callee": _preferred_cdr_callee(redis_data),
             "customer_id": redis_data.get("customer_id"),
             "dest_type": dest_type,
             "dest_value": dest_value,  # Where it actually went
