@@ -255,6 +255,33 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
 # REDIS OPERATIONS
 # =============================================================================
 
+UUID_INDEX_PREFIX = "cdr:index:uuid"
+
+
+def _uuid_index_key(uuid: str) -> str:
+    """Build stable Redis key for UUID -> customer_id index."""
+    return f"{UUID_INDEX_PREFIX}:{uuid}"
+
+
+def _resolve_customer_id_for_uuid(redis_client, uuid: str, incoming_customer_id: str) -> str:
+    """Resolve stable customer_id for a call UUID.
+
+    Keeps backward-compatible customer:<customer_id>:call:<uuid> keys while
+    preventing key drift when customer_id changes during call lifecycle.
+    """
+    idx_key = _uuid_index_key(uuid)
+    indexed_customer = redis_client.get(idx_key)
+    if indexed_customer:
+        return indexed_customer
+
+    chosen_customer = incoming_customer_id or "unknown"
+    created = redis_client.set(idx_key, chosen_customer, nx=True)
+    if created:
+        return chosen_customer
+
+    # If another worker wrote it first, use final indexed value.
+    return redis_client.get(idx_key) or chosen_customer
+
 def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
     """Store call data in Redis with optimized pipeline."""
     redis_client = get_redis()
@@ -263,11 +290,15 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
     
     try:
         uuid = call_data.get("uuid")
-        customer_id = call_data.get("customer_id") or "unknown"
         if not uuid:
             return False
+
+        incoming_customer_id = call_data.get("customer_id") or "unknown"
+        customer_id = _resolve_customer_id_for_uuid(redis_client, uuid, incoming_customer_id)
+        call_data["customer_id"] = customer_id
         
         key = f"customer:{customer_id}:call:{uuid}"
+        idx_key = _uuid_index_key(uuid)
         new_status = call_data.get("call_status")
         
         # Prevent status downgrade
@@ -278,6 +309,8 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
         
         # Pipeline for atomic operations
         pipe = redis_client.pipeline(transaction=False)
+        pipe.set(idx_key, customer_id)
+        pipe.expire(idx_key, config.REDIS_CALL_TTL)
         pipe.hset(key, mapping={k: str(v) if v is not None else "" for k, v in call_data.items()})
         pipe.expire(key, config.REDIS_CALL_TTL)
         
@@ -303,6 +336,8 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
         return None
     
     try:
+        idx_key = _uuid_index_key(uuid)
+
         # Try cache first
         customer_id = customer_cache.get(uuid)
         if customer_id:
@@ -310,15 +345,27 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
             data = redis_client.hgetall(key)
             if data:
                 return data
+
+        # Try stable UUID index
+        indexed_customer = redis_client.get(idx_key)
+        if indexed_customer:
+            key = f"customer:{indexed_customer}:call:{uuid}"
+            data = redis_client.hgetall(key)
+            if data:
+                customer_cache.set(uuid, indexed_customer)
+                return data
         
-        # Fallback: scan (slower)
+        # Fallback scan for compatibility with existing in-flight keys.
         pattern = f"customer:*:call:{uuid}"
         for key in redis_client.scan_iter(match=pattern, count=100):
             data = redis_client.hgetall(key)
             if data:
                 parts = key.split(":")
                 if len(parts) >= 2:
-                    customer_cache.set(uuid, parts[1])
+                    found_customer = parts[1]
+                    customer_cache.set(uuid, found_customer)
+                    redis_client.set(idx_key, found_customer)
+                    redis_client.expire(idx_key, config.REDIS_CALL_TTL)
                 return data
         return None
         
@@ -334,8 +381,13 @@ def remove_call_from_redis(uuid: str, customer_id: str):
         return
     
     try:
+        idx_key = _uuid_index_key(uuid)
+        indexed_customer = redis_client.get(idx_key)
+        effective_customer = indexed_customer or customer_id or customer_cache.get(uuid) or "unknown"
+
         pipe = redis_client.pipeline(transaction=False)
-        pipe.delete(f"customer:{customer_id}:call:{uuid}")
+        pipe.delete(f"customer:{effective_customer}:call:{uuid}")
+        pipe.delete(idx_key)
         pipe.srem("active_calls", uuid)
         pipe.execute()
         customer_cache.remove(uuid)
