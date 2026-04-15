@@ -18,10 +18,10 @@ from functools import lru_cache
 # Local imports - work both as package and direct run
 try:
     from . import config
-    from .connections import get_redis, get_lookup_redis, get_pg_connection
+    from .connections import get_redis, get_lookup_redis, get_pg_connection, get_redis_client_name
 except ImportError:
     import config
-    from connections import get_redis, get_lookup_redis, get_pg_connection
+    from connections import get_redis, get_lookup_redis, get_pg_connection, get_redis_client_name
 
 logger = logging.getLogger("monitor.handlers")
 
@@ -347,7 +347,8 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
             idx_exists = redis_client.exists(idx_key)
             logger.debug(
                 f"Redis upsert ok uuid={uuid[:8]}... customer={customer_id} "
-                f"key_exists={bool(hash_exists)} idx_exists={bool(idx_exists)} results={results}"
+                f"key_exists={bool(hash_exists)} idx_exists={bool(idx_exists)} results={results} "
+                f"source_client={get_redis_client_name() or 'unknown'}"
             )
         
         customer_cache.set(uuid, customer_id)
@@ -397,7 +398,8 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
                 customer_cache.set(uuid, indexed_customer)
                 return data
             logger.warning(
-                f"Redis index orphan detected: uuid={uuid[:8]}... index_customer={indexed_customer} but hash missing"
+                f"Redis index orphan detected: uuid={uuid[:8]}... index_customer={indexed_customer} but hash missing "
+                f"source_client={get_redis_client_name() or 'unknown'}"
             )
         
         # Fallback scan for compatibility with existing in-flight keys.
@@ -426,7 +428,8 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
             if candidates:
                 seen = ",".join(sorted({c for c, _ in candidates}))
                 logger.warning(
-                    f"Redis index conflict: uuid={uuid[:8]}... index_customer={indexed_customer} but found_hash_customers=[{seen}]"
+                    f"Redis index conflict: uuid={uuid[:8]}... index_customer={indexed_customer} "
+                    f"but found_hash_customers=[{seen}] source_client={get_redis_client_name() or 'unknown'}"
                 )
                 # Return first candidate to avoid dropping CDR processing, but keep index unchanged.
                 found_customer, data = candidates[0]
@@ -440,7 +443,8 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
                 redis_client.set(idx_key, found_customer)
                 redis_client.expire(idx_key, config.REDIS_CALL_TTL)
                 logger.warning(
-                    f"Redis index self-healed: uuid={uuid[:8]}... index_customer=none -> {found_customer}"
+                    f"Redis index self-healed: uuid={uuid[:8]}... index_customer=none -> {found_customer} "
+                    f"source_client={get_redis_client_name() or 'unknown'}"
                 )
                 return data
 
@@ -452,13 +456,15 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
                     redis_client.set(idx_key, found_customer)
                     redis_client.expire(idx_key, config.REDIS_CALL_TTL)
                     logger.warning(
-                        f"Redis index self-healed (preferred valid namespace): uuid={uuid[:8]}... -> {found_customer}"
+                        f"Redis index self-healed (preferred valid namespace): uuid={uuid[:8]}... -> {found_customer} "
+                        f"source_client={get_redis_client_name() or 'unknown'}"
                     )
                     return data
 
                 seen = ",".join(sorted({c for c, _ in candidates}))
                 logger.warning(
-                    f"Redis index ambiguous: uuid={uuid[:8]}... candidates=[{seen}] (index not updated)"
+                    f"Redis index ambiguous: uuid={uuid[:8]}... candidates=[{seen}] (index not updated) "
+                    f"source_client={get_redis_client_name() or 'unknown'}"
                 )
                 found_customer, data = candidates[0]
                 customer_cache.set(uuid, found_customer)
@@ -467,7 +473,10 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
         # No hash found anywhere; clean stale index to avoid repeated misses.
         if indexed_customer:
             redis_client.delete(idx_key)
-            logger.warning(f"Redis index removed (stale): uuid={uuid[:8]}... customer={indexed_customer}")
+            logger.warning(
+                f"Redis index removed (stale): uuid={uuid[:8]}... customer={indexed_customer} "
+                f"source_client={get_redis_client_name() or 'unknown'}"
+            )
         return None
         
     except Exception as e:
@@ -500,7 +509,7 @@ def remove_call_from_redis(uuid: str, customer_id: str):
         if getattr(config, "LOG_DEBUG_EVENTS", False):
             logger.debug(
                 f"Redis cleanup uuid={uuid[:8]}... indexed_customer={indexed_customer or 'none'} "
-                f"requested_customer={customer_id or 'none'}"
+                f"requested_customer={customer_id or 'none'} source_client={get_redis_client_name() or 'unknown'}"
             )
         customer_cache.remove(uuid)
     except Exception as e:
