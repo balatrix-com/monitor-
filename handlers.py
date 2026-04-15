@@ -11,17 +11,16 @@ import time
 import queue
 import threading
 import sqlite3
-import re
 from typing import Dict, Optional, Any
 from functools import lru_cache
 
 # Local imports - work both as package and direct run
 try:
     from . import config
-    from .connections import get_redis, get_lookup_redis, get_pg_connection, get_redis_client_name
+    from .connections import get_redis, get_lookup_redis, get_pg_connection
 except ImportError:
     import config
-    from connections import get_redis, get_lookup_redis, get_pg_connection, get_redis_client_name
+    from connections import get_redis, get_lookup_redis, get_pg_connection
 
 logger = logging.getLogger("monitor.handlers")
 
@@ -99,11 +98,9 @@ def _cached_customer_lookup(number: str) -> Optional[str]:
         normalized = digits[1:] if len(digits) == 11 and digits.startswith('1') else digits
         key = f"{config.LOOKUP_REDIS_NUMBER_KEY_PREFIX}:{normalized}"
         customer_id = lookup_redis.get(key)
-        if customer_id and _is_valid_customer_id(customer_id):
+        if customer_id:
             logger.debug(f"Lookup Redis number matched {number} as {normalized}: {customer_id}")
             return customer_id
-        if customer_id:
-            logger.warning(f"Lookup Redis number returned invalid customer_id: {customer_id} for {normalized}")
         return None
     except Exception as e:
         logger.error(f"Lookup Redis number error for {number}: {e}")
@@ -136,11 +133,9 @@ def _cached_extension_lookup(extension: str) -> Optional[str]:
         prefix = digits[:prefix_len]
         key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{prefix}"
         customer_id = lookup_redis.get(key)
-        if customer_id and _is_valid_customer_id(customer_id):
+        if customer_id:
             logger.debug(f"Lookup Redis extension matched {extension} as {prefix}: {customer_id}")
             return customer_id
-        if customer_id:
-            logger.warning(f"Lookup Redis extension returned invalid customer_id: {customer_id} for {prefix}")
         return None
     except Exception as e:
         logger.error(f"Lookup Redis extension error for {extension}: {e}")
@@ -262,45 +257,6 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
 # REDIS OPERATIONS
 # =============================================================================
 
-UUID_INDEX_PREFIX = "cdr:index:uuid"
-VALID_CUSTOMER_ID_RE = re.compile(r"^[UC][0-9]+$")
-
-
-def _uuid_index_key(uuid: str) -> str:
-    """Build stable Redis key for UUID -> customer_id index."""
-    return f"{UUID_INDEX_PREFIX}:{uuid}"
-
-
-def _is_valid_customer_id(customer_id: Optional[str]) -> bool:
-    """Validate customer_id namespace used for Redis CDR keys."""
-    return bool(customer_id and VALID_CUSTOMER_ID_RE.match(customer_id))
-
-
-def _resolve_customer_id_for_uuid(redis_client, uuid: str, incoming_customer_id: str) -> tuple:
-    """Resolve stable customer_id for a call UUID.
-
-    Keeps backward-compatible customer:<customer_id>:call:<uuid> keys while
-    preventing key drift when customer_id changes during call lifecycle.
-    """
-    idx_key = _uuid_index_key(uuid)
-    indexed_customer = redis_client.get(idx_key)
-    if indexed_customer and _is_valid_customer_id(indexed_customer):
-        return indexed_customer, False
-    if indexed_customer and not _is_valid_customer_id(indexed_customer):
-        logger.warning(f"Invalid indexed customer_id dropped: uuid={uuid[:8]}... customer={indexed_customer}")
-        redis_client.delete(idx_key)
-
-    chosen_customer = incoming_customer_id if _is_valid_customer_id(incoming_customer_id) else "unknown"
-    created = redis_client.set(idx_key, chosen_customer, nx=True)
-    if created:
-        return chosen_customer, True
-
-    # If another worker wrote it first, use final indexed value.
-    final_indexed = redis_client.get(idx_key)
-    if _is_valid_customer_id(final_indexed):
-        return final_indexed, False
-    return chosen_customer, False
-
 def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
     """Store call data in Redis with optimized pipeline."""
     redis_client = get_redis()
@@ -312,12 +268,10 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
         if not uuid:
             return False
 
-        incoming_customer_id = call_data.get("customer_id") or "unknown"
-        customer_id, created_index = _resolve_customer_id_for_uuid(redis_client, uuid, incoming_customer_id)
+        customer_id = call_data.get("customer_id") or "unknown"
         call_data["customer_id"] = customer_id
-        
+
         key = f"customer:{customer_id}:call:{uuid}"
-        idx_key = _uuid_index_key(uuid)
         new_status = call_data.get("call_status")
         
         # Prevent status downgrade
@@ -328,8 +282,6 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
         
         # Pipeline for atomic operations
         pipe = redis_client.pipeline(transaction=False)
-        pipe.set(idx_key, customer_id)
-        pipe.expire(idx_key, config.REDIS_CALL_TTL)
         pipe.hset(key, mapping={k: str(v) if v is not None else "" for k, v in call_data.items()})
         pipe.expire(key, config.REDIS_CALL_TTL)
         
@@ -340,27 +292,18 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
         pipe.publish("calls_stream", json.dumps(call_data))
         results = pipe.execute()
 
-        # Basic sanity check: hash key and index key should exist after write.
-        # Keep this lightweight and only do extra checks when debug events are enabled.
+        # Basic sanity check: hash key should exist after write.
         if getattr(config, "LOG_DEBUG_EVENTS", False):
             hash_exists = redis_client.exists(key)
-            idx_exists = redis_client.exists(idx_key)
             logger.debug(
                 f"Redis upsert ok uuid={uuid[:8]}... customer={customer_id} "
-                f"key_exists={bool(hash_exists)} idx_exists={bool(idx_exists)} results={results} "
-                f"source_client={get_redis_client_name() or 'unknown'}"
+                f"key_exists={bool(hash_exists)} results={results}"
             )
         
         customer_cache.set(uuid, customer_id)
         return True
         
     except Exception as e:
-        # If index was freshly created but hash write failed, remove index to avoid orphaned index-only state.
-        try:
-            if 'created_index' in locals() and created_index and 'uuid' in locals() and uuid:
-                redis_client.delete(_uuid_index_key(uuid))
-        except Exception:
-            pass
         logger.error(f"Redis store error: {e}")
         return False
 
@@ -372,8 +315,6 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
         return None
     
     try:
-        idx_key = _uuid_index_key(uuid)
-
         # Try cache first
         customer_id = customer_cache.get(uuid)
         if customer_id:
@@ -382,101 +323,14 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
             if data:
                 return data
 
-        # Try stable UUID index
-        indexed_customer = redis_client.get(idx_key)
-        if indexed_customer and not _is_valid_customer_id(indexed_customer):
-            logger.warning(
-                f"Invalid indexed customer_id ignored: uuid={uuid[:8]}... customer={indexed_customer}"
-            )
-            redis_client.delete(idx_key)
-            indexed_customer = None
-
-        if indexed_customer:
-            key = f"customer:{indexed_customer}:call:{uuid}"
-            data = redis_client.hgetall(key)
-            if data:
-                customer_cache.set(uuid, indexed_customer)
-                return data
-            logger.warning(
-                f"Redis index orphan detected: uuid={uuid[:8]}... index_customer={indexed_customer} but hash missing "
-                f"source_client={get_redis_client_name() or 'unknown'}"
-            )
-        
         # Fallback scan for compatibility with existing in-flight keys.
-        candidates = []
         pattern = f"customer:*:call:{uuid}"
         for key in redis_client.scan_iter(match=pattern, count=100):
             data = redis_client.hgetall(key)
             if data:
-                parts = key.split(":")
-                if len(parts) >= 2:
-                    found_customer = parts[1]
-                    if _is_valid_customer_id(found_customer):
-                        candidates.append((found_customer, data))
-                    else:
-                        logger.warning(
-                            f"Ignored legacy customer namespace: uuid={uuid[:8]}... customer={found_customer}"
-                        )
-
-        if indexed_customer:
-            # Never rewrite an existing index to a different customer namespace.
-            for found_customer, data in candidates:
-                if found_customer == indexed_customer:
-                    customer_cache.set(uuid, indexed_customer)
-                    return data
-
-            if candidates:
-                seen = ",".join(sorted({c for c, _ in candidates}))
-                logger.warning(
-                    f"Redis index conflict: uuid={uuid[:8]}... index_customer={indexed_customer} "
-                    f"but found_hash_customers=[{seen}] source_client={get_redis_client_name() or 'unknown'}"
-                )
-                # Return first candidate to avoid dropping CDR processing, but keep index unchanged.
-                found_customer, data = candidates[0]
+                found_customer = key.split(":", 2)[1]
                 customer_cache.set(uuid, found_customer)
                 return data
-
-        else:
-            if len(candidates) == 1:
-                found_customer, data = candidates[0]
-                customer_cache.set(uuid, found_customer)
-                redis_client.set(idx_key, found_customer)
-                redis_client.expire(idx_key, config.REDIS_CALL_TTL)
-                logger.warning(
-                    f"Redis index self-healed: uuid={uuid[:8]}... index_customer=none -> {found_customer} "
-                    f"source_client={get_redis_client_name() or 'unknown'}"
-                )
-                return data
-
-            if len(candidates) > 1:
-                preferred = [item for item in candidates if item[0].startswith("U") or item[0].startswith("C")]
-                if len(preferred) == 1:
-                    found_customer, data = preferred[0]
-                    customer_cache.set(uuid, found_customer)
-                    redis_client.set(idx_key, found_customer)
-                    redis_client.expire(idx_key, config.REDIS_CALL_TTL)
-                    logger.warning(
-                        f"Redis index self-healed (preferred valid namespace): uuid={uuid[:8]}... -> {found_customer} "
-                        f"source_client={get_redis_client_name() or 'unknown'}"
-                    )
-                    return data
-
-                seen = ",".join(sorted({c for c, _ in candidates}))
-                logger.warning(
-                    f"Redis index ambiguous: uuid={uuid[:8]}... candidates=[{seen}] (index not updated) "
-                    f"source_client={get_redis_client_name() or 'unknown'}"
-                )
-                found_customer, data = candidates[0]
-                customer_cache.set(uuid, found_customer)
-                return data
-
-        # No hash found anywhere; clean stale index to avoid repeated misses.
-        if indexed_customer:
-            redis_client.delete(idx_key)
-            logger.warning(
-                f"Redis index removed (stale): uuid={uuid[:8]}... customer={indexed_customer} "
-                f"source_client={get_redis_client_name() or 'unknown'}"
-            )
         return None
         
     except Exception as e:
@@ -491,26 +345,13 @@ def remove_call_from_redis(uuid: str, customer_id: str):
         return
     
     try:
-        idx_key = _uuid_index_key(uuid)
-        indexed_customer = redis_client.get(idx_key)
         pipe = redis_client.pipeline(transaction=False)
-        customers_to_delete = {
-            indexed_customer,
-            customer_id,
-            customer_cache.get(uuid),
-            "unknown"
-        }
-        for cid in customers_to_delete:
-            if cid and (cid == "unknown" or _is_valid_customer_id(cid)):
-                pipe.delete(f"customer:{cid}:call:{uuid}")
-        pipe.delete(idx_key)
+        key_customer = customer_cache.get(uuid) or customer_id or "unknown"
+        pipe.delete(f"customer:{key_customer}:call:{uuid}")
         pipe.srem("active_calls", uuid)
         pipe.execute()
         if getattr(config, "LOG_DEBUG_EVENTS", False):
-            logger.debug(
-                f"Redis cleanup uuid={uuid[:8]}... indexed_customer={indexed_customer or 'none'} "
-                f"requested_customer={customer_id or 'none'} source_client={get_redis_client_name() or 'unknown'}"
-            )
+            logger.debug(f"Redis cleanup uuid={uuid[:8]}... requested_customer={customer_id or 'none'}")
         customer_cache.remove(uuid)
     except Exception as e:
         logger.error(f"Redis remove error: {e}")

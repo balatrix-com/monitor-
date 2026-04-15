@@ -7,8 +7,6 @@ Thread-safe with auto-reconnect capabilities.
 """
 import logging
 import time
-import os
-import socket
 from typing import Optional, Dict
 from contextlib import contextmanager
 
@@ -24,15 +22,6 @@ except ImportError:
     import config
 
 logger = logging.getLogger("monitor.connections")
-
-_runtime_redis_client_name: str = ""
-_runtime_lookup_redis_client_name: str = ""
-
-
-def _build_client_name(base: str) -> str:
-    """Build a process-unique Redis client name."""
-    host = socket.gethostname()
-    return f"{base}:{host}:{os.getpid()}"
 
 
 # =============================================================================
@@ -50,7 +39,6 @@ class RedisManager:
     
     def connect(self) -> bool:
         """Initialize Redis connection pool."""
-        global _runtime_redis_client_name
         try:
             self._pool = ConnectionPool(
                 host=config.REDIS_HOST,
@@ -66,12 +54,8 @@ class RedisManager:
             )
             self._client = redis.Redis(connection_pool=self._pool)
             self._client.ping()
-            _runtime_redis_client_name = _build_client_name(config.REDIS_CLIENT_NAME_BASE)
-            self._client.client_setname(_runtime_redis_client_name)
             self._error_count = 0
-            logger.info(
-                f"Redis connected: {config.REDIS_HOST}:{config.REDIS_PORT} name={_runtime_redis_client_name}"
-            )
+            logger.info(f"Redis connected: {config.REDIS_HOST}:{config.REDIS_PORT}")
             return True
         except Exception as e:
             logger.error(f"Redis connection failed: {e}")
@@ -127,7 +111,6 @@ class LookupRedisManager:
 
     def connect(self) -> bool:
         """Initialize lookup Redis connection pool."""
-        global _runtime_lookup_redis_client_name
         try:
             self._pool = ConnectionPool(
                 host=config.LOOKUP_REDIS_HOST,
@@ -143,12 +126,9 @@ class LookupRedisManager:
             )
             self._client = redis.Redis(connection_pool=self._pool)
             self._client.ping()
-            _runtime_lookup_redis_client_name = _build_client_name(config.LOOKUP_REDIS_CLIENT_NAME_BASE)
-            self._client.client_setname(_runtime_lookup_redis_client_name)
             self._error_count = 0
             logger.info(
-                f"Lookup Redis connected: {config.LOOKUP_REDIS_HOST}:{config.LOOKUP_REDIS_PORT}/{config.LOOKUP_REDIS_DB} "
-                f"name={_runtime_lookup_redis_client_name}"
+                f"Lookup Redis connected: {config.LOOKUP_REDIS_HOST}:{config.LOOKUP_REDIS_PORT}/{config.LOOKUP_REDIS_DB}"
             )
             return True
         except Exception as e:
@@ -402,16 +382,6 @@ def get_redis() -> Optional[redis.Redis]:
 def get_lookup_redis() -> Optional[redis.Redis]:
     """Get lookup Redis client (DB2 by default)."""
     return lookup_redis_manager.client
-
-
-def get_redis_client_name() -> str:
-    """Get runtime Redis client name used by this monitor process."""
-    return _runtime_redis_client_name
-
-
-def get_lookup_redis_client_name() -> str:
-    """Get runtime lookup Redis client name used by this monitor process."""
-    return _runtime_lookup_redis_client_name
 
 
 def get_pg_connection():
