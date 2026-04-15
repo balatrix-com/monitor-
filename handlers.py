@@ -365,6 +365,7 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
             )
         
         # Fallback scan for compatibility with existing in-flight keys.
+        candidates = []
         pattern = f"customer:*:call:{uuid}"
         for key in redis_client.scan_iter(match=pattern, count=100):
             data = redis_client.hgetall(key)
@@ -372,12 +373,54 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
                 parts = key.split(":")
                 if len(parts) >= 2:
                     found_customer = parts[1]
+                    candidates.append((found_customer, data))
+
+        if indexed_customer:
+            # Never rewrite an existing index to a different customer namespace.
+            for found_customer, data in candidates:
+                if found_customer == indexed_customer:
+                    customer_cache.set(uuid, indexed_customer)
+                    return data
+
+            if candidates:
+                seen = ",".join(sorted({c for c, _ in candidates}))
+                logger.warning(
+                    f"Redis index conflict: uuid={uuid[:8]}... index_customer={indexed_customer} but found_hash_customers=[{seen}]"
+                )
+                # Return first candidate to avoid dropping CDR processing, but keep index unchanged.
+                found_customer, data = candidates[0]
+                customer_cache.set(uuid, found_customer)
+                return data
+
+        else:
+            if len(candidates) == 1:
+                found_customer, data = candidates[0]
+                customer_cache.set(uuid, found_customer)
+                redis_client.set(idx_key, found_customer)
+                redis_client.expire(idx_key, config.REDIS_CALL_TTL)
+                logger.warning(
+                    f"Redis index self-healed: uuid={uuid[:8]}... index_customer=none -> {found_customer}"
+                )
+                return data
+
+            if len(candidates) > 1:
+                preferred = [item for item in candidates if item[0].startswith("U")]
+                if len(preferred) == 1:
+                    found_customer, data = preferred[0]
                     customer_cache.set(uuid, found_customer)
                     redis_client.set(idx_key, found_customer)
                     redis_client.expire(idx_key, config.REDIS_CALL_TTL)
                     logger.warning(
-                        f"Redis index self-healed: uuid={uuid[:8]}... index_customer={indexed_customer or 'none'} -> {found_customer}"
+                        f"Redis index self-healed (preferred U*): uuid={uuid[:8]}... -> {found_customer}"
                     )
+                    return data
+
+                seen = ",".join(sorted({c for c, _ in candidates}))
+                logger.warning(
+                    f"Redis index ambiguous: uuid={uuid[:8]}... candidates=[{seen}] (index not updated)"
+                )
+                found_customer, data = candidates[0]
+                customer_cache.set(uuid, found_customer)
                 return data
 
         # No hash found anywhere; clean stale index to avoid repeated misses.
@@ -400,10 +443,16 @@ def remove_call_from_redis(uuid: str, customer_id: str):
     try:
         idx_key = _uuid_index_key(uuid)
         indexed_customer = redis_client.get(idx_key)
-        effective_customer = indexed_customer or customer_id or customer_cache.get(uuid) or "unknown"
-
         pipe = redis_client.pipeline(transaction=False)
-        pipe.delete(f"customer:{effective_customer}:call:{uuid}")
+        customers_to_delete = {
+            indexed_customer,
+            customer_id,
+            customer_cache.get(uuid),
+            "unknown"
+        }
+        for cid in customers_to_delete:
+            if cid:
+                pipe.delete(f"customer:{cid}:call:{uuid}")
         pipe.delete(idx_key)
         pipe.srem("active_calls", uuid)
         pipe.execute()
