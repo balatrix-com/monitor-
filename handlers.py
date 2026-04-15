@@ -257,6 +257,16 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
 # REDIS OPERATIONS
 # =============================================================================
 
+
+def _primary_call_key(uuid: str) -> str:
+    """Stable primary Redis key for a call."""
+    return f"call:{uuid}"
+
+
+def _customer_call_key(customer_id: str, uuid: str) -> str:
+    """Compatibility Redis key used by existing downstream consumers."""
+    return f"customer:{customer_id}:call:{uuid}"
+
 def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
     """Store call data in Redis with optimized pipeline."""
     redis_client = get_redis()
@@ -270,20 +280,25 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
 
         customer_id = call_data.get("customer_id") or "unknown"
         call_data["customer_id"] = customer_id
-
-        key = f"customer:{customer_id}:call:{uuid}"
+        primary_key = _primary_call_key(uuid)
+        customer_key = _customer_call_key(customer_id, uuid)
         new_status = call_data.get("call_status")
         
         # Prevent status downgrade
         if new_status == "ringing":
-            existing = redis_client.hget(key, "call_status")
+            existing = redis_client.hget(primary_key, "call_status")
             if existing in ["answered", "connected"]:
                 call_data["call_status"] = existing
         
         # Pipeline for atomic operations
+        mapping = {k: str(v) if v is not None else "" for k, v in call_data.items()}
         pipe = redis_client.pipeline(transaction=False)
-        pipe.hset(key, mapping={k: str(v) if v is not None else "" for k, v in call_data.items()})
-        pipe.expire(key, config.REDIS_CALL_TTL)
+        # Primary source of truth
+        pipe.hset(primary_key, mapping=mapping)
+        pipe.expire(primary_key, config.REDIS_CALL_TTL)
+        # Compatibility key for consumers expecting customer:<id>:call:<uuid>
+        pipe.hset(customer_key, mapping=mapping)
+        pipe.expire(customer_key, config.REDIS_CALL_TTL)
         
         status = call_data.get("call_status")
         if status in ["new", "ringing", "answered", "connected"]:
@@ -294,10 +309,11 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
 
         # Basic sanity check: hash key should exist after write.
         if getattr(config, "LOG_DEBUG_EVENTS", False):
-            hash_exists = redis_client.exists(key)
+            primary_exists = redis_client.exists(primary_key)
+            customer_exists = redis_client.exists(customer_key)
             logger.debug(
                 f"Redis upsert ok uuid={uuid[:8]}... customer={customer_id} "
-                f"key_exists={bool(hash_exists)} results={results}"
+                f"primary_exists={bool(primary_exists)} customer_key_exists={bool(customer_exists)} results={results}"
             )
         
         customer_cache.set(uuid, customer_id)
@@ -315,12 +331,24 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
         return None
     
     try:
+        # Primary lookup (stable key)
+        primary_key = _primary_call_key(uuid)
+        primary_data = redis_client.hgetall(primary_key)
+        if primary_data:
+            found_customer = primary_data.get("customer_id")
+            if found_customer:
+                customer_cache.set(uuid, found_customer)
+            return primary_data
+
         # Try cache first
         customer_id = customer_cache.get(uuid)
         if customer_id:
-            key = f"customer:{customer_id}:call:{uuid}"
+            key = _customer_call_key(customer_id, uuid)
             data = redis_client.hgetall(key)
             if data:
+                # Backfill primary key for future reads
+                redis_client.hset(primary_key, mapping={k: str(v) if v is not None else "" for k, v in data.items()})
+                redis_client.expire(primary_key, config.REDIS_CALL_TTL)
                 return data
 
         # Fallback scan for compatibility with existing in-flight keys.
@@ -330,6 +358,9 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
             if data:
                 found_customer = key.split(":", 2)[1]
                 customer_cache.set(uuid, found_customer)
+                # Backfill primary key for future reads
+                redis_client.hset(primary_key, mapping={k: str(v) if v is not None else "" for k, v in data.items()})
+                redis_client.expire(primary_key, config.REDIS_CALL_TTL)
                 return data
         return None
         
@@ -347,7 +378,14 @@ def remove_call_from_redis(uuid: str, customer_id: str):
     try:
         pipe = redis_client.pipeline(transaction=False)
         key_customer = customer_cache.get(uuid) or customer_id or "unknown"
-        pipe.delete(f"customer:{key_customer}:call:{uuid}")
+        # Remove primary key
+        pipe.delete(_primary_call_key(uuid))
+        # Remove current known compatibility key
+        pipe.delete(_customer_call_key(key_customer, uuid))
+        # Remove any stale compatibility keys from previous customer namespaces
+        pattern = f"customer:*:call:{uuid}"
+        for key in redis_client.scan_iter(match=pattern, count=100):
+            pipe.delete(key)
         pipe.srem("active_calls", uuid)
         pipe.execute()
         if getattr(config, "LOG_DEBUG_EVENTS", False):
