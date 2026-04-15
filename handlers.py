@@ -11,6 +11,7 @@ import time
 import queue
 import threading
 import sqlite3
+import re
 from typing import Dict, Optional, Any
 from functools import lru_cache
 
@@ -203,6 +204,73 @@ def determine_call_direction(event_dict: Dict[str, str]) -> str:
     ).lower()
 
 
+ROUTE_KEY_RE = re.compile(r"^(ext|rg|ivr|fwd|sched)\d+_[A-Za-z0-9]+(?:__\d+)?$", re.IGNORECASE)
+ROUTE_PREFIX_TO_TYPE = {
+    "ext": "extension",
+    "rg": "ring_group",
+    "ivr": "ivr",
+    "fwd": "did_forward",
+    "sched": "schedule",
+}
+
+
+def _extract_route_key(value: str) -> str:
+    """Return normalized route key when value matches configured dialplan formats."""
+    if not value:
+        return ""
+    token = value.strip().lower()
+    if ROUTE_KEY_RE.match(token):
+        return token
+    return ""
+
+
+def _route_type_from_key(route_key: str) -> str:
+    """Map route key prefix to route family label."""
+    if not route_key:
+        return ""
+    prefix = route_key.split("_", 1)[0]
+    family = re.match(r"^[a-zA-Z]+", prefix)
+    if not family:
+        return ""
+    return ROUTE_PREFIX_TO_TYPE.get(family.group(0).lower(), "")
+
+
+def _resolve_entry_route(event_dict: Dict[str, str], fallback: str = "") -> tuple:
+    """Resolve first-known route key/type from event fields."""
+    candidates = [
+        event_dict.get("variable_route_key", ""),
+        event_dict.get("variable_inbound_did", ""),
+        event_dict.get("Caller-Destination-Number", ""),
+        event_dict.get("Other-Leg-Destination-Number", ""),
+        fallback,
+    ]
+    for candidate in candidates:
+        key = _extract_route_key(candidate or "")
+        if key:
+            return key, _route_type_from_key(key)
+    return "", ""
+
+
+def _resolve_route_type_for_cdr(a_leg_data: Dict[str, str]) -> str:
+    """Resolve route family for final CDR labeling."""
+    explicit = (a_leg_data.get("entry_route_type") or "").strip().lower()
+    if explicit:
+        return explicit
+
+    candidates = [
+        a_leg_data.get("entry_route_key", ""),
+        a_leg_data.get("route_key", ""),
+        a_leg_data.get("inbound_did", ""),
+        a_leg_data.get("forwarded_to", ""),
+        a_leg_data.get("original_did", ""),
+    ]
+    for candidate in candidates:
+        key = _extract_route_key(candidate or "")
+        if key:
+            return _route_type_from_key(key)
+    return ""
+
+
 def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
     """
     Determine call type and return tuple:
@@ -219,6 +287,7 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
     original_callee = a_leg_data.get("callee", "")
     caller = a_leg_data.get("caller", "")
     has_rdnis = a_leg_data.get("has_rdnis", "false") == "true"
+    route_type = _resolve_route_type_for_cdr(a_leg_data)
     
     caller_internal = is_internal(caller)
     dest_internal = is_internal(forwarded_to)
@@ -226,31 +295,31 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
     # No B-leg - simple call with no bridge
     if not b_uuid:
         if not caller_internal:  # External caller, no bridge = INBOUND
-            return "INBOUND", "extension", original_callee, ""
+            return "INBOUND", (route_type or "extension"), original_callee, ""
         return "OUTBOUND", "unknown", "", ""
     
     # === DID_FORWARD Detection ===
     # External caller -> External destination + RDNIS present = forwarded call
     if not caller_internal and not dest_internal and has_rdnis:
-        return "DID_FORWARD", "external", forwarded_to, forwarded_to
+        return "DID_FORWARD", (route_type or "external"), forwarded_to, forwarded_to
     
     # === INBOUND Detection ===
     # External caller -> Internal extension = answered internally
     if not caller_internal and dest_internal:
-        return "INBOUND", "extension", forwarded_to, ""
+        return "INBOUND", (route_type or "extension"), forwarded_to, ""
     
     # === OUTBOUND Detection ===
     # Internal extension -> External destination (user-initiated outbound)
     if caller_internal and not dest_internal:
-        return "OUTBOUND", "external", forwarded_to, forwarded_to
+        return "OUTBOUND", (route_type or "external"), forwarded_to, forwarded_to
     
     # === INTERNAL Detection ===
     # Internal extension -> Internal extension
     if caller_internal and dest_internal:
-        return "INTERNAL", "extension", forwarded_to, ""
+        return "INTERNAL", (route_type or "extension"), forwarded_to, ""
     
     # Fallback
-    dest_type = "extension" if dest_internal else "external"
+    dest_type = route_type or ("extension" if dest_internal else "external")
     return "OUTBOUND", dest_type, forwarded_to, forwarded_to
 
 
@@ -859,6 +928,12 @@ def handle_create(event_dict: Dict[str, str]):
                 "original_did": callee,  # Preserve original DID
                 "answer_ts": "",
             }
+
+            entry_route_key, entry_route_type = _resolve_entry_route(event_dict, callee)
+            call_data["route_key"] = entry_route_key
+            call_data["inbound_did"] = event_dict.get("variable_inbound_did", "")
+            call_data["entry_route_key"] = entry_route_key
+            call_data["entry_route_type"] = entry_route_type
             
             if not store_call_in_redis(call_data):
                 stats.error()
@@ -885,6 +960,15 @@ def handle_create(event_dict: Dict[str, str]):
             a_leg["b_uuid"] = uuid
             a_leg["forwarded_to"] = b_dest
             a_leg["has_rdnis"] = "true" if rdnis else "false"
+
+            # Preserve first-seen route family and keep latest route key for diagnostics.
+            b_route_key, b_route_type = _resolve_entry_route(event_dict, b_dest)
+            if b_route_key:
+                a_leg["route_key"] = b_route_key
+            if not a_leg.get("entry_route_key") and b_route_key:
+                a_leg["entry_route_key"] = b_route_key
+            if not a_leg.get("entry_route_type") and b_route_type:
+                a_leg["entry_route_type"] = b_route_type
                 
             # For outbound calls, store the originating extension
             if is_internal(a_leg.get("caller", "")):
