@@ -263,7 +263,7 @@ def _uuid_index_key(uuid: str) -> str:
     return f"{UUID_INDEX_PREFIX}:{uuid}"
 
 
-def _resolve_customer_id_for_uuid(redis_client, uuid: str, incoming_customer_id: str) -> str:
+def _resolve_customer_id_for_uuid(redis_client, uuid: str, incoming_customer_id: str) -> tuple:
     """Resolve stable customer_id for a call UUID.
 
     Keeps backward-compatible customer:<customer_id>:call:<uuid> keys while
@@ -272,15 +272,15 @@ def _resolve_customer_id_for_uuid(redis_client, uuid: str, incoming_customer_id:
     idx_key = _uuid_index_key(uuid)
     indexed_customer = redis_client.get(idx_key)
     if indexed_customer:
-        return indexed_customer
+        return indexed_customer, False
 
     chosen_customer = incoming_customer_id or "unknown"
     created = redis_client.set(idx_key, chosen_customer, nx=True)
     if created:
-        return chosen_customer
+        return chosen_customer, True
 
     # If another worker wrote it first, use final indexed value.
-    return redis_client.get(idx_key) or chosen_customer
+    return redis_client.get(idx_key) or chosen_customer, False
 
 def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
     """Store call data in Redis with optimized pipeline."""
@@ -294,7 +294,7 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
             return False
 
         incoming_customer_id = call_data.get("customer_id") or "unknown"
-        customer_id = _resolve_customer_id_for_uuid(redis_client, uuid, incoming_customer_id)
+        customer_id, created_index = _resolve_customer_id_for_uuid(redis_client, uuid, incoming_customer_id)
         call_data["customer_id"] = customer_id
         
         key = f"customer:{customer_id}:call:{uuid}"
@@ -325,6 +325,12 @@ def store_call_in_redis(call_data: Dict[str, Any]) -> bool:
         return True
         
     except Exception as e:
+        # If index was freshly created but hash write failed, remove index to avoid orphaned index-only state.
+        try:
+            if 'created_index' in locals() and created_index and 'uuid' in locals() and uuid:
+                redis_client.delete(_uuid_index_key(uuid))
+        except Exception:
+            pass
         logger.error(f"Redis store error: {e}")
         return False
 
@@ -354,6 +360,9 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
             if data:
                 customer_cache.set(uuid, indexed_customer)
                 return data
+            logger.warning(
+                f"Redis index orphan detected: uuid={uuid[:8]}... index_customer={indexed_customer} but hash missing"
+            )
         
         # Fallback scan for compatibility with existing in-flight keys.
         pattern = f"customer:*:call:{uuid}"
@@ -366,7 +375,15 @@ def get_call_from_redis(uuid: str) -> Optional[Dict[str, str]]:
                     customer_cache.set(uuid, found_customer)
                     redis_client.set(idx_key, found_customer)
                     redis_client.expire(idx_key, config.REDIS_CALL_TTL)
+                    logger.warning(
+                        f"Redis index self-healed: uuid={uuid[:8]}... index_customer={indexed_customer or 'none'} -> {found_customer}"
+                    )
                 return data
+
+        # No hash found anywhere; clean stale index to avoid repeated misses.
+        if indexed_customer:
+            redis_client.delete(idx_key)
+            logger.warning(f"Redis index removed (stale): uuid={uuid[:8]}... customer={indexed_customer}")
         return None
         
     except Exception as e:
