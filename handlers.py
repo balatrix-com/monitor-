@@ -1162,6 +1162,28 @@ EVENT_HANDLERS = {
 }
 
 
+# Per-call ordering guard: process same call-group events serially while
+# preserving parallelism across different calls.
+EVENT_LOCK_SHARDS = 256
+_event_shard_locks = [threading.Lock() for _ in range(EVENT_LOCK_SHARDS)]
+
+
+def _event_anchor_uuid(event_dict: Dict[str, str]) -> str:
+    """Return stable call-group anchor UUID for event ordering.
+
+    For B-leg events, Other-Leg-Unique-ID usually points to A-leg UUID,
+    which groups A/B events for the same call under one lock shard.
+    """
+    return (event_dict.get("Other-Leg-Unique-ID") or event_dict.get("Unique-ID") or "")
+
+
+def _event_lock_for(anchor_uuid: str):
+    """Get sharded lock for a call-group anchor UUID."""
+    if not anchor_uuid:
+        return None
+    return _event_shard_locks[hash(anchor_uuid) % EVENT_LOCK_SHARDS]
+
+
 def process_event(event):
     """Route event to appropriate handler."""
     try:
@@ -1173,7 +1195,13 @@ def process_event(event):
         
         handler = EVENT_HANDLERS.get(event_name)
         if handler:
-            handler(event_dict)
+            anchor_uuid = _event_anchor_uuid(event_dict)
+            lock = _event_lock_for(anchor_uuid)
+            if lock:
+                with lock:
+                    handler(event_dict)
+            else:
+                handler(event_dict)
         else:
             # Log unhandled events for debugging
             logger.debug(f"Unhandled event: {event_name}")
