@@ -296,7 +296,10 @@ def classify_call_type(a_leg_data: Dict[str, str]) -> tuple:
     if not b_uuid:
         if not caller_internal:  # External caller, no bridge = INBOUND
             return "INBOUND", (route_type or "extension"), original_callee, ""
-        return "OUTBOUND", "unknown", "", ""
+        # Outbound attempt can fail before B-leg is created; keep dialed destination.
+        fallback_dest = forwarded_to or original_callee
+        fallback_type = "outbound" if fallback_dest else "unknown"
+        return "OUTBOUND", fallback_type, fallback_dest, fallback_dest
     
     # === DID_FORWARD Detection ===
     # External caller -> External destination + RDNIS present = forwarded call
