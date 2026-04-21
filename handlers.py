@@ -1092,11 +1092,13 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
         
         # If this UUID is NOT in Redis but has other_leg, it's a B-leg hangup - ignore
         if not redis_data and other_leg:
+            customer_cache.remove(uuid)
             logger.debug(f"B-leg hangup ignored (uuid not in Redis)")
             return
         
         # If we have no Redis data at all, nothing to process
         if not redis_data:
+            customer_cache.remove(uuid)
             logger.debug(f"HANGUP_COMPLETE: {uuid[:8]}... - no Redis data")
             return
         
