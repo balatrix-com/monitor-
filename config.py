@@ -37,7 +37,7 @@ LOG_FILE = LOG_DIR / "monitor.log"
 # FREESWITCH ESL CONFIGURATION
 # =============================================================================
 
-FS_ESL_HOST = _env("FS_ESL_HOST", "10.30.0.58")
+FS_ESL_HOST = _env("FS_ESL_HOST", "10.10.0.3")
 FS_ESL_PORT = _env_int("FS_ESL_PORT", 8021)
 FS_ESL_PASSWORD = _env("FS_ESL_PASSWORD", "ClueCon")
 
@@ -46,7 +46,7 @@ FS_ESL_PASSWORD = _env("FS_ESL_PASSWORD", "ClueCon")
 # REDIS CONFIGURATION
 # =============================================================================
 
-REDIS_HOST = _env("REDIS_HOST", "10.30.0.2")
+REDIS_HOST = _env("REDIS_HOST", "10.10.0.2")
 REDIS_PORT = _env_int("REDIS_PORT", 6379)
 REDIS_DB = _env_int("REDIS_DB", 0)
 REDIS_PASSWORD = _env("REDIS_PASSWORD", "OnidaMaruti1)")
@@ -60,7 +60,7 @@ REDIS_HEALTH_CHECK_INTERVAL = _env_int("REDIS_HEALTH_CHECK_INTERVAL", 30)
 REDIS_CALL_TTL = _env_int("REDIS_CALL_TTL", 86400)  # 24 hours
 
 # Lookup Redis configuration (managed by external sync service)
-LOOKUP_REDIS_HOST = _env("LOOKUP_REDIS_HOST", "10.30.0.2")
+LOOKUP_REDIS_HOST = _env("LOOKUP_REDIS_HOST", "10.10.0.2")
 LOOKUP_REDIS_PORT = _env_int("LOOKUP_REDIS_PORT", 6379)
 LOOKUP_REDIS_DB = _env_int("LOOKUP_REDIS_DB", 2)
 LOOKUP_REDIS_PASSWORD = _env("LOOKUP_REDIS_PASSWORD", "OnidaMaruti1)")
@@ -78,7 +78,7 @@ LOOKUP_EXTENSION_PREFIX_LEN = _env_int("LOOKUP_EXTENSION_PREFIX_LEN", 4)
 # POSTGRESQL CONFIGURATION (CDR / live_call_events)
 # =============================================================================
 
-PG_HOST = _env("PG_HOST", "10.30.0.6")
+PG_HOST = _env("PG_HOST", "10.10.0.6")
 PG_PORT = _env_int("PG_PORT", 5432)
 PG_DATABASE = _env("PG_DATABASE", "bala_billing")
 PG_USER = _env("PG_USER", "bill_eng1")
@@ -95,7 +95,7 @@ PG_CONNECT_TIMEOUT = _env_int("PG_CONNECT_TIMEOUT", 5)
 # CUSTOMER DATABASE CONFIGURATION (tfns table for customer lookup)
 # =============================================================================
 
-CUSTOMER_PG_HOST = _env("CUSTOMER_PG_HOST", "10.30.0.6")
+CUSTOMER_PG_HOST = _env("CUSTOMER_PG_HOST", "10.10.0.6")
 CUSTOMER_PG_PORT = _env_int("CUSTOMER_PG_PORT", 5432)
 CUSTOMER_PG_DATABASE = _env("CUSTOMER_PG_DATABASE", "subtest")
 CUSTOMER_PG_USER = _env("CUSTOMER_PG_USER", "subadmin")
