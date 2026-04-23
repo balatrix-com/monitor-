@@ -131,6 +131,11 @@ HEARTBEAT_INTERVAL = _env_int("HEARTBEAT_INTERVAL", 60)
 ESL_RECONNECT_DELAY = _env_int("ESL_RECONNECT_DELAY", 5)
 ESL_KEEPALIVE_INTERVAL = _env_int("ESL_KEEPALIVE_INTERVAL", 10)
 
+# Orphan call recovery (force-write missed calls to DB, then clean Redis/cache)
+ORPHAN_REAPER_ENABLED = _env_bool("ORPHAN_REAPER_ENABLED", True)
+ORPHAN_REAPER_AGE_SECONDS = _env_int("ORPHAN_REAPER_AGE_SECONDS", 1800)
+ORPHAN_REAPER_MAX_PER_CYCLE = _env_int("ORPHAN_REAPER_MAX_PER_CYCLE", 500)
+
 
 # =============================================================================
 # LOGGING SETTINGS

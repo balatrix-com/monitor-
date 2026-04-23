@@ -869,6 +869,89 @@ def get_cdr_queue_size() -> int:
     return cdr_batcher.pending_count()
 
 
+def recover_orphan_call(uuid: str, reason: str = "stale") -> bool:
+    """Force-finalize a potentially orphaned call into DB, then cleanup Redis/cache.
+
+    This is used by periodic/startup reconciliation when a call remains in active_calls
+    but normal hangup finalization did not complete.
+    """
+    try:
+        now_ts = int(time.time())
+        redis_data = get_call_from_redis(uuid)
+
+        if redis_data:
+            call_type, dest_type, dest_value, egress_trunk = classify_call_type(redis_data)
+            start_ts_raw = redis_data.get("start_ts") or "0"
+            try:
+                start_ts = int(start_ts_raw)
+            except Exception:
+                start_ts = 0
+
+            duration = max(0, now_ts - start_ts) if start_ts > 0 else 0
+            cdr = {
+                "uuid": uuid,
+                "b_uuid": redis_data.get("b_uuid"),
+                "event_type": "orphan_cleanup",
+                "event_ts": now_ts,
+                "caller": redis_data.get("caller") or "unknown",
+                "callee": _preferred_cdr_callee(redis_data) or "unknown",
+                "customer_id": redis_data.get("customer_id") or "unknown",
+                "dest_type": dest_type or "unknown",
+                "dest_value": dest_value or "",
+                "status_code": "ORPHAN_RECOVERED",
+                "call_type": call_type or "unknown",
+                "duration": duration,
+                "billsec": int(redis_data.get("billsec") or 0),
+                "ingress_trunk": redis_data.get("ingress_trunk") or "",
+                "egress_trunk": egress_trunk or redis_data.get("egress_trunk") or "",
+                "call_status": "hangup",
+            }
+
+            if call_type == "OUTBOUND":
+                cdr["outbound_caller_id"] = redis_data.get("outbound_caller_id", redis_data.get("caller"))
+                cdr["originating_extension"] = redis_data.get("originating_extension", redis_data.get("caller"))
+                cdr["originating_leg_uuid"] = uuid
+            elif call_type == "INBOUND":
+                cdr["outbound_caller_id"] = ""
+                cdr["originating_extension"] = ""
+        else:
+            # Worst-case fallback: we only know UUID from active_calls; still persist a marker CDR.
+            cdr = {
+                "uuid": uuid,
+                "b_uuid": "",
+                "event_type": "orphan_cleanup",
+                "event_ts": now_ts,
+                "caller": "unknown",
+                "callee": "unknown",
+                "customer_id": "unknown",
+                "dest_type": "unknown",
+                "dest_value": "",
+                "status_code": "ORPHAN_RECOVERED",
+                "call_type": "unknown",
+                "duration": 0,
+                "billsec": 0,
+                "ingress_trunk": "",
+                "egress_trunk": "",
+                "call_status": "hangup",
+            }
+
+        if not save_cdr_to_postgres(cdr):
+            logger.error(f"Orphan recovery DB enqueue failed uuid={uuid[:8]}... reason={reason}")
+            return False
+
+        redis_client = get_redis()
+        if redis_client:
+            redis_client.publish("calls_stream", json.dumps(cdr))
+
+        remove_call_from_redis(uuid, (cdr.get("customer_id") or "unknown"))
+        logger.warning(f"Recovered orphan call uuid={uuid[:8]}... reason={reason}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Orphan recovery error uuid={uuid[:8] if uuid else 'unknown'}...: {e}")
+        return False
+
+
 # =============================================================================
 # EVENT HANDLERS
 # =============================================================================
