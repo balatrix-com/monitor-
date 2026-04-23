@@ -33,12 +33,30 @@ import greenswitch
 # Local imports - work both as package and direct run
 try:
     from . import config
-    from .connections import init_connections, close_connections, health_check, redis_manager, postgres_manager
-    from .handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size, clear_customer_lookup_cache
+    from .connections import init_connections, close_connections, health_check, redis_manager, lookup_redis_manager, postgres_manager
+    from .handlers import (
+        process_event,
+        stats,
+        customer_cache,
+        start_cdr_workers,
+        get_cdr_queue_size,
+        clear_customer_lookup_cache,
+        get_call_from_redis,
+        recover_orphan_call,
+    )
 except ImportError:
     import config
-    from connections import init_connections, close_connections, health_check, redis_manager, postgres_manager
-    from handlers import process_event, stats, customer_cache, start_cdr_workers, get_cdr_queue_size, clear_customer_lookup_cache
+    from connections import init_connections, close_connections, health_check, redis_manager, lookup_redis_manager, postgres_manager
+    from handlers import (
+        process_event,
+        stats,
+        customer_cache,
+        start_cdr_workers,
+        get_cdr_queue_size,
+        clear_customer_lookup_cache,
+        get_call_from_redis,
+        recover_orphan_call,
+    )
 
 
 # =============================================================================
@@ -106,6 +124,65 @@ def process_event_async(event):
         logger.error(f"Worker error: {e}")
 
 
+def reconcile_orphan_calls(reason: str) -> int:
+    """Force-finalize stale calls from active_calls and clean Redis/cache.
+
+    Returns number of calls recovered in this cycle.
+    """
+    if not getattr(config, "ORPHAN_REAPER_ENABLED", True):
+        return 0
+
+    redis_client = redis_manager.client
+    if not redis_client:
+        return 0
+
+    recovered = 0
+    scanned = 0
+    now = int(time.time())
+    threshold = max(1, int(getattr(config, "ORPHAN_REAPER_AGE_SECONDS", 1800)))
+    max_per_cycle = max(1, int(getattr(config, "ORPHAN_REAPER_MAX_PER_CYCLE", 500)))
+
+    try:
+        active_uuids = list(redis_client.smembers("active_calls") or [])
+    except Exception as e:
+        logger.error(f"Orphan reconcile read failed ({reason}): {e}")
+        return 0
+
+    for uuid in active_uuids:
+        if scanned >= max_per_cycle:
+            break
+
+        scanned += 1
+        try:
+            call_data = get_call_from_redis(uuid)
+            if not call_data:
+                # Orphan set member with missing hash; still force-write marker CDR.
+                if recover_orphan_call(uuid, reason=f"{reason}:missing_hash"):
+                    recovered += 1
+                continue
+
+            start_ts_raw = call_data.get("start_ts") or "0"
+            try:
+                start_ts = int(start_ts_raw)
+            except Exception:
+                start_ts = 0
+
+            age = (now - start_ts) if start_ts > 0 else threshold
+            if age >= threshold:
+                if recover_orphan_call(uuid, reason=f"{reason}:age_{age}"):
+                    recovered += 1
+        except Exception as e:
+            logger.error(f"Orphan reconcile item failed uuid={uuid[:8]}... ({reason}): {e}")
+
+    if scanned and recovered:
+        logger.warning(
+            f"Orphan reconcile ({reason}) recovered={recovered} scanned={scanned} "
+            f"threshold={threshold}s"
+        )
+
+    return recovered
+
+
 # =============================================================================
 # HEALTH CHECK & MONITORING
 # =============================================================================
@@ -125,12 +202,18 @@ def health_check_loop():
                 redis_client = redis_manager.client
                 active = redis_client.scard("active_calls") if redis_client else 0
                 health = health_check()
+
+                recovered = reconcile_orphan_calls("heartbeat")
+                if recovered:
+                    # Refresh active after reconciliation for accurate heartbeat metric.
+                    active = redis_client.scard("active_calls") if redis_client else 0
                 
                 logger.info(
                     f"♥ Heartbeat: events={stats.count} errors={stats.errors} "
                     f"active={active} cache={customer_cache.size()} "
                     f"cdr_queue={get_cdr_queue_size()} "
                     f"redis={'✓' if health['redis'] else '✗'} "
+                    f"lookup_redis={'✓' if health['lookup_redis'] else '✗'} "
                     f"pg={'✓' if health['postgres'] else '✗'}"
                 )
                 last_heartbeat = now
@@ -142,6 +225,7 @@ def health_check_loop():
             
             # Ensure connections
             redis_manager.ensure_connected()
+            lookup_redis_manager.ensure_connected()
             postgres_manager.ensure_connected()
             
             gevent.sleep(config.HEALTH_CHECK_INTERVAL)
@@ -258,6 +342,9 @@ def main():
     
     # Start CDR background workers
     start_cdr_workers()
+
+    # Startup reconciliation for stale active calls after restart/crash.
+    reconcile_orphan_calls("startup")
     
     # Start health check greenlet
     health_greenlet = gevent.spawn(health_check_loop)

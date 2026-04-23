@@ -37,7 +37,7 @@ LOG_FILE = LOG_DIR / "monitor.log"
 # FREESWITCH ESL CONFIGURATION
 # =============================================================================
 
-FS_ESL_HOST = _env("FS_ESL_HOST", "51.79.127.113")
+FS_ESL_HOST = _env("FS_ESL_HOST", "10.10.0.3")
 FS_ESL_PORT = _env_int("FS_ESL_PORT", 8021)
 FS_ESL_PASSWORD = _env("FS_ESL_PASSWORD", "ClueCon")
 
@@ -59,6 +59,20 @@ REDIS_HEALTH_CHECK_INTERVAL = _env_int("REDIS_HEALTH_CHECK_INTERVAL", 30)
 # Redis key settings
 REDIS_CALL_TTL = _env_int("REDIS_CALL_TTL", 86400)  # 24 hours
 
+# Lookup Redis configuration (managed by external sync service)
+LOOKUP_REDIS_HOST = _env("LOOKUP_REDIS_HOST", "10.10.0.2")
+LOOKUP_REDIS_PORT = _env_int("LOOKUP_REDIS_PORT", 6379)
+LOOKUP_REDIS_DB = _env_int("LOOKUP_REDIS_DB", 2)
+LOOKUP_REDIS_PASSWORD = _env("LOOKUP_REDIS_PASSWORD", "OnidaMaruti1)")
+LOOKUP_REDIS_SOCKET_TIMEOUT = _env_int("LOOKUP_REDIS_SOCKET_TIMEOUT", 5)
+LOOKUP_REDIS_MAX_CONNECTIONS = _env_int("LOOKUP_REDIS_MAX_CONNECTIONS", 100)
+LOOKUP_REDIS_HEALTH_CHECK_INTERVAL = _env_int("LOOKUP_REDIS_HEALTH_CHECK_INTERVAL", 30)
+
+# Lookup key format settings
+LOOKUP_REDIS_NUMBER_KEY_PREFIX = _env("LOOKUP_REDIS_NUMBER_KEY_PREFIX", "lookup:v1:number")
+LOOKUP_REDIS_EXT_KEY_PREFIX = _env("LOOKUP_REDIS_EXT_KEY_PREFIX", "lookup:v1:ext")
+LOOKUP_EXTENSION_PREFIX_LEN = _env_int("LOOKUP_EXTENSION_PREFIX_LEN", 4)
+
 
 # =============================================================================
 # POSTGRESQL CONFIGURATION (CDR / live_call_events)
@@ -66,9 +80,9 @@ REDIS_CALL_TTL = _env_int("REDIS_CALL_TTL", 86400)  # 24 hours
 
 PG_HOST = _env("PG_HOST", "10.10.0.6")
 PG_PORT = _env_int("PG_PORT", 5432)
-PG_DATABASE = _env("PG_DATABASE", "frendsahil")
-PG_USER = _env("PG_USER", "frend1")
-PG_PASSWORD = _env("PG_PASSWORD", "SolidMasti1!")
+PG_DATABASE = _env("PG_DATABASE", "bala_billing")
+PG_USER = _env("PG_USER", "bill_eng1")
+PG_PASSWORD = _env("PG_PASSWORD", "Bill2k26x")
 
 # PostgreSQL pool settings
 # Keep this conservative for shared DB (total max_connections=150 across services).
@@ -81,10 +95,10 @@ PG_CONNECT_TIMEOUT = _env_int("PG_CONNECT_TIMEOUT", 5)
 # CUSTOMER DATABASE CONFIGURATION (tfns table for customer lookup)
 # =============================================================================
 
-CUSTOMER_PG_HOST = _env("CUSTOMER_PG_HOST", "10.10.0.7")
+CUSTOMER_PG_HOST = _env("CUSTOMER_PG_HOST", "10.10.0.6")
 CUSTOMER_PG_PORT = _env_int("CUSTOMER_PG_PORT", 5432)
 CUSTOMER_PG_DATABASE = _env("CUSTOMER_PG_DATABASE", "subtest")
-CUSTOMER_PG_USER = _env("CUSTOMER_PG_USER", "admin")
+CUSTOMER_PG_USER = _env("CUSTOMER_PG_USER", "subadmin")
 CUSTOMER_PG_PASSWORD = _env("CUSTOMER_PG_PASSWORD", "OnidaMaruti1)")
 CUSTOMER_PG_MIN_CONNECTIONS = _env_int("CUSTOMER_PG_MIN_CONNECTIONS", 5)
 CUSTOMER_PG_MAX_CONNECTIONS = _env_int("CUSTOMER_PG_MAX_CONNECTIONS", 50)
@@ -116,6 +130,11 @@ HEALTH_CHECK_INTERVAL = _env_int("HEALTH_CHECK_INTERVAL", 30)
 HEARTBEAT_INTERVAL = _env_int("HEARTBEAT_INTERVAL", 60)
 ESL_RECONNECT_DELAY = _env_int("ESL_RECONNECT_DELAY", 5)
 ESL_KEEPALIVE_INTERVAL = _env_int("ESL_KEEPALIVE_INTERVAL", 10)
+
+# Orphan call recovery (force-write missed calls to DB, then clean Redis/cache)
+ORPHAN_REAPER_ENABLED = _env_bool("ORPHAN_REAPER_ENABLED", True)
+ORPHAN_REAPER_AGE_SECONDS = _env_int("ORPHAN_REAPER_AGE_SECONDS", 1800)
+ORPHAN_REAPER_MAX_PER_CYCLE = _env_int("ORPHAN_REAPER_MAX_PER_CYCLE", 500)
 
 
 # =============================================================================

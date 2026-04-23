@@ -100,6 +100,80 @@ class RedisManager:
         self._pool = None
 
 
+class LookupRedisManager:
+    """Thread-safe lookup Redis manager (DB2 by default)."""
+
+    def __init__(self):
+        self._pool: Optional[ConnectionPool] = None
+        self._client: Optional[redis.Redis] = None
+        self._last_error_time: float = 0
+        self._error_count: int = 0
+
+    def connect(self) -> bool:
+        """Initialize lookup Redis connection pool."""
+        try:
+            self._pool = ConnectionPool(
+                host=config.LOOKUP_REDIS_HOST,
+                port=config.LOOKUP_REDIS_PORT,
+                db=config.LOOKUP_REDIS_DB,
+                password=config.LOOKUP_REDIS_PASSWORD,
+                decode_responses=True,
+                max_connections=config.LOOKUP_REDIS_MAX_CONNECTIONS,
+                socket_timeout=config.LOOKUP_REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=config.LOOKUP_REDIS_SOCKET_TIMEOUT,
+                socket_keepalive=True,
+                health_check_interval=config.LOOKUP_REDIS_HEALTH_CHECK_INTERVAL
+            )
+            self._client = redis.Redis(connection_pool=self._pool)
+            self._client.ping()
+            self._error_count = 0
+            logger.info(
+                f"Lookup Redis connected: {config.LOOKUP_REDIS_HOST}:{config.LOOKUP_REDIS_PORT}/{config.LOOKUP_REDIS_DB}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Lookup Redis connection failed: {e}")
+            self._error_count += 1
+            self._last_error_time = time.time()
+            return False
+
+    @property
+    def client(self) -> Optional[redis.Redis]:
+        """Get lookup Redis client, reconnecting if needed."""
+        if self._client is None:
+            self.connect()
+        return self._client
+
+    def is_connected(self) -> bool:
+        """Check if lookup Redis is connected."""
+        try:
+            if self._client:
+                self._client.ping()
+                return True
+        except:
+            pass
+        return False
+
+    def ensure_connected(self) -> bool:
+        """Ensure lookup Redis connection, reconnect if needed."""
+        if self.is_connected():
+            return True
+        logger.warning("Lookup Redis disconnected, reconnecting...")
+        return self.connect()
+
+    def close(self):
+        """Close all lookup Redis connections."""
+        try:
+            if self._client:
+                self._client.close()
+            if self._pool:
+                self._pool.disconnect()
+        except:
+            pass
+        self._client = None
+        self._pool = None
+
+
 # =============================================================================
 # POSTGRESQL CONNECTION MANAGER
 # =============================================================================
@@ -291,6 +365,7 @@ class CustomerPostgresManager:
 # =============================================================================
 
 redis_manager = RedisManager()
+lookup_redis_manager = LookupRedisManager()
 postgres_manager = PostgresManager()
 customer_postgres_manager = CustomerPostgresManager()
 
@@ -302,6 +377,11 @@ customer_postgres_manager = CustomerPostgresManager()
 def get_redis() -> Optional[redis.Redis]:
     """Get Redis client."""
     return redis_manager.client
+
+
+def get_lookup_redis() -> Optional[redis.Redis]:
+    """Get lookup Redis client (DB2 by default)."""
+    return lookup_redis_manager.client
 
 
 def get_pg_connection():
@@ -317,14 +397,18 @@ def get_customer_pg_connection():
 def init_connections() -> bool:
     """Initialize all connections."""
     redis_ok = redis_manager.connect()
+    lookup_redis_ok = lookup_redis_manager.connect()
     pg_ok = postgres_manager.connect()
     customer_pg_ok = customer_postgres_manager.connect()
-    return redis_ok and pg_ok and customer_pg_ok
+    if not customer_pg_ok:
+        logger.warning("Customer PostgreSQL unavailable at startup (lookup now uses Redis)")
+    return redis_ok and lookup_redis_ok and pg_ok
 
 
 def close_connections():
     """Close all connections."""
     redis_manager.close()
+    lookup_redis_manager.close()
     postgres_manager.close()
     customer_postgres_manager.close()
 
@@ -333,6 +417,7 @@ def health_check() -> Dict[str, bool]:
     """Check health of all connections."""
     return {
         "redis": redis_manager.is_connected(),
+        "lookup_redis": lookup_redis_manager.is_connected(),
         "postgres": postgres_manager.is_connected(),
         "customer_postgres": customer_postgres_manager.is_connected()
     }
