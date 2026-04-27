@@ -71,7 +71,8 @@ LOOKUP_REDIS_HEALTH_CHECK_INTERVAL = _env_int("LOOKUP_REDIS_HEALTH_CHECK_INTERVA
 # Lookup key format settings
 LOOKUP_REDIS_NUMBER_KEY_PREFIX = _env("LOOKUP_REDIS_NUMBER_KEY_PREFIX", "lookup:v1:number")
 LOOKUP_REDIS_EXT_KEY_PREFIX = _env("LOOKUP_REDIS_EXT_KEY_PREFIX", "lookup:v1:ext")
-LOOKUP_EXTENSION_PREFIX_LEN = _env_int("LOOKUP_EXTENSION_PREFIX_LEN", 4)
+# Prefix length includes leading alpha when extension is prefixed (e.g. U004101 -> U0041).
+LOOKUP_EXTENSION_PREFIX_LEN = _env_int("LOOKUP_EXTENSION_PREFIX_LEN", 5)
 
 
 # =============================================================================
@@ -115,7 +116,7 @@ EVENT_WORKER_POOL_SIZE = _env_int("EVENT_WORKER_POOL_SIZE", 250)
 CDR_QUEUE_WORKERS = _env_int("CDR_QUEUE_WORKERS", 10)
 
 # Event queue settings
-EVENT_QUEUE_MAX_SIZE = _env_int("EVENT_QUEUE_MAX_SIZE", 1000)
+EVENT_QUEUE_MAX_SIZE = _env_int("EVENT_QUEUE_MAX_SIZE", 1500)
 
 # Cache settings
 CUSTOMER_CACHE_MAX_SIZE = _env_int("CUSTOMER_CACHE_MAX_SIZE", 10000)
