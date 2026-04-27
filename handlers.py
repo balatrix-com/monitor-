@@ -25,6 +25,11 @@ except ImportError:
 
 logger = logging.getLogger("monitor.handlers")
 
+# Internal extension formats supported:
+# - legacy numeric: 3-6 digits (e.g. 602001)
+# - prefixed: one letter + 6 digits (e.g. U004101, C000601)
+INTERNAL_PREFIXED_EXT_RE = re.compile(r"^[A-Za-z]\d{6}$")
+
 
 # =============================================================================
 # CUSTOMER ID CACHE
@@ -126,16 +131,28 @@ def _cached_extension_lookup(extension: str) -> Optional[str]:
         return None
 
     try:
-        digits = ''.join(c for c in extension if c.isdigit())
+        token = (extension or "").strip().upper()
+        prefix_len = max(1, int(getattr(config, 'LOOKUP_EXTENSION_PREFIX_LEN', 5)))
+
+        # Preferred format: prefixed extension (e.g. U004101 -> prefix U0041)
+        if INTERNAL_PREFIXED_EXT_RE.fullmatch(token):
+            prefixed_key = token[:min(len(token), prefix_len)]
+            key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{prefixed_key}"
+            customer_id = lookup_redis.get(key)
+            if customer_id:
+                logger.debug(f"Lookup Redis extension matched {extension} as {prefixed_key}: {customer_id}")
+                return customer_id
+
+        # Backward-compatible fallback: numeric-only extension keys.
+        digits = ''.join(c for c in token if c.isdigit())
         if not digits:
             return None
 
-        prefix_len = max(1, int(getattr(config, 'LOOKUP_EXTENSION_PREFIX_LEN', 4)))
-        prefix = digits[:prefix_len]
-        key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{prefix}"
+        numeric_prefix = digits[:prefix_len]
+        key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{numeric_prefix}"
         customer_id = lookup_redis.get(key)
         if customer_id:
-            logger.debug(f"Lookup Redis extension matched {extension} as {prefix}: {customer_id}")
+            logger.debug(f"Lookup Redis extension matched {extension} as {numeric_prefix}: {customer_id}")
             return customer_id
         return None
     except Exception as e:
@@ -165,9 +182,12 @@ def is_internal(number: str) -> bool:
     """Check if number is internal extension vs external/trunk."""
     if not number:
         return False
-    # 3-6 digits = internal extension
-    # 7+ digits or non-numeric = external
-    return len(number) <= 6 and number.isdigit()
+    token = (number or "").strip()
+    # Legacy internal extension: 3-6 digits.
+    if token.isdigit():
+        return 3 <= len(token) <= 6
+    # New prefixed extension format: U004101 / C000601.
+    return bool(INTERNAL_PREFIXED_EXT_RE.fullmatch(token))
 
 
 def determine_destination(event_data: Dict[str, str]) -> tuple:
@@ -182,16 +202,16 @@ def determine_destination(event_data: Dict[str, str]) -> tuple:
         event_data.get("Caller-Destination-Number") or ""
     )
     
-    if bridge_to and bridge_to.isdigit():
-        if len(bridge_to) <= 6:
-            if bridge_to.startswith('5'):
-                return "queue", bridge_to
-            elif bridge_to.startswith('6'):
-                return "ivr", bridge_to
-            return "extension", bridge_to
-        return "external", bridge_to
-    elif bridge_to:
-        return "external", bridge_to
+    if bridge_to:
+        token = bridge_to.strip()
+        if is_internal(token):
+            # Preserve queue/ivr detection for legacy numeric extensions.
+            if token.isdigit() and token.startswith('5'):
+                return "queue", token
+            if token.isdigit() and token.startswith('6'):
+                return "ivr", token
+            return "extension", token
+        return "external", token
     return "unknown", ""
 
 
